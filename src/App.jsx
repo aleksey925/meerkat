@@ -161,7 +161,7 @@ function ContextMenu({ mr, position, onClose, onToggleUnread, onSetReminder, onC
 }
 
 // ─── MR Card Component ─────────────────────────────────────────────────────
-function MrCard({ mr, isSelected, isResolved, onSelect, onContextMenu, onOpenGitLab }) {
+function MrCard({ mr, isSelected, isResolved, onSelect, onContextMenu, onOpenGitLab, onToggleUnread }) {
   const author = getAuthorInfo(mr);
   const pipeline = mr.pipelineStatus || mr.pipeline;
   const approvals = mr.approvalsCurrent ?? mr.approvals ?? 0;
@@ -180,6 +180,22 @@ function MrCard({ mr, isSelected, isResolved, onSelect, onContextMenu, onOpenGit
           <div className="mr-title-row">
             <div className="mr-title">{mr.title}</div>
             <div className="mr-actions">
+              <button
+                className={`mr-action-btn read-btn${mr.unread ? "" : " is-read"}`}
+                onClick={(e) => { e.stopPropagation(); onToggleUnread(mr.id); }}
+                title={mr.unread ? "Mark as read" : "Mark as unread"}
+              >
+                {mr.unread ? (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M20 6L9 17l-5-5" />
+                  </svg>
+                )}
+              </button>
               <button className="mr-action-btn" onClick={(e) => { e.stopPropagation(); onContextMenu(e, mr.id); }} title="Actions">{"\u2026"}</button>
               <button className="mr-action-btn gl-btn" onClick={(e) => { e.stopPropagation(); onOpenGitLab(mr); }} title="Open in GitLab">{"\u21D7"} GitLab</button>
             </div>
@@ -408,6 +424,7 @@ function InboxView({
   selectedTab, selectedMrId, searchQuery, loading, lastChecked, checking,
   onSelectProject, onSelectRole, onSelectTab, onSelectMr,
   onSearch, onContextMenu, onToggleUnread, onOpenGitLab, onRemindClick, onCheckNow,
+  sortBy, onSortChange,
 }) {
   const lastCheckedLabel = useRelativeTime(lastChecked);
   const filtered = (() => {
@@ -422,6 +439,14 @@ function InboxView({
         (m.sourceBranch && m.sourceBranch.toLowerCase().includes(q))
       );
     }
+    list = [...list].sort((a, b) => {
+      if (sortBy === "unread") {
+        if (a.unread !== b.unread) return a.unread ? -1 : 1;
+      }
+      const ta = new Date(a.updatedAt || 0).getTime();
+      const tb = new Date(b.updatedAt || 0).getTime();
+      return tb - ta;
+    });
     return list;
   })();
 
@@ -482,13 +507,29 @@ function InboxView({
         </button>
       </div>
 
-      <input
-        className="search-box"
-        type="text"
-        placeholder="Search merge requests..."
-        value={searchQuery}
-        onChange={(e) => onSearch(e.target.value)}
-      />
+      <div className="filter-bar">
+        <input
+          className="search-box"
+          type="text"
+          placeholder="Search merge requests..."
+          value={searchQuery}
+          onChange={(e) => onSearch(e.target.value)}
+        />
+        {selectedTab === "active" && (
+          <div className="sort-wrapper">
+            <span className="sort-icon">{"\u21C5"}</span>
+            <select
+              className="sort-select"
+              value={sortBy}
+              onChange={(e) => onSortChange(e.target.value)}
+              title="Sort order"
+            >
+              <option value="unread">Unread first</option>
+              <option value="updated">By update time</option>
+            </select>
+          </div>
+        )}
+      </div>
 
       <div className="main-wrap">
         <div className="main-content">
@@ -515,6 +556,7 @@ function InboxView({
                   onSelect={onSelectMr}
                   onContextMenu={onContextMenu}
                   onOpenGitLab={onOpenGitLab}
+                  onToggleUnread={onToggleUnread}
                 />
               ))
             )}
@@ -542,6 +584,7 @@ export default function App() {
   const [selectedTab, setSelectedTab] = useState("active");
   const [selectedMrId, setSelectedMrId] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [sortBy, setSortBy] = useState("unread");
   const [toast, setToast] = useState(null);
   const [notifPermission, setNotifPermission] = useState(null);
   const [ctxMenu, setCtxMenu] = useState(null);
@@ -635,10 +678,7 @@ export default function App() {
 
   const handleSelectMr = useCallback((id) => {
     setSelectedMrId((prev) => prev === id ? null : id);
-    if (id) {
-      gitlab.markAsRead(id);
-    }
-  }, [gitlab.markAsRead]);
+  }, []);
 
   const openGitLab = useCallback((mr) => {
     gitlab.openGitLab(mr);
@@ -801,6 +841,8 @@ export default function App() {
           onOpenGitLab={openGitLab}
           onRemindClick={handleRemindClick}
           onCheckNow={gitlab.checkNow}
+          sortBy={sortBy}
+          onSortChange={setSortBy}
         />
       )}
 
