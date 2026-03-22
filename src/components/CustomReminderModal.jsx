@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import DatePicker from "react-datepicker";
 import "react-datepicker/dist/react-datepicker.css";
+import formatDateTime from "../utils/formatDateTime";
 
 function TimeInput({ hours, minutes, onChangeHours, onChangeMinutes }) {
   const hoursRef = useRef(null);
@@ -147,14 +148,10 @@ export default function CustomReminderModal({ isOpen, position, onClose, onConfi
     if (!selectedDate || hours.length === 0 || minutes.length === 0) return;
     const hh = hours.padStart(2, "0");
     const mm = minutes.padStart(2, "0");
-    const y = selectedDate.getFullYear();
-    const mo = String(selectedDate.getMonth() + 1).padStart(2, "0");
-    const d = String(selectedDate.getDate()).padStart(2, "0");
-    const date = `${y}-${mo}-${d}`;
     const dt = new Date(selectedDate);
     dt.setHours(parseInt(hh), parseInt(mm), 0, 0);
     const isoDate = dt.toISOString();
-    const display = `${date} ${hh}:${mm}`;
+    const display = formatDateTime(dt);
     onConfirm(display, isoDate);
     onClose();
   };

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import "./App.css";
+import formatDateTime from "./utils/formatDateTime";
 import { useSettings } from "./hooks/useSettings";
 import { useGitlab } from "./hooks/useGitlab";
 import CustomReminderModal from "./components/CustomReminderModal";
@@ -256,7 +257,7 @@ function DetailPanel({ mr, onClose, onToggleUnread, onOpenGitLab, onRemindClick 
               </div>
               <div className="act-body">
                 <div className="act-text">{a.text}</div>
-                <div className="act-time">{a.time}</div>
+                <div className="act-time">{formatDateTime(a.time)}</div>
               </div>
             </div>
           ))}
