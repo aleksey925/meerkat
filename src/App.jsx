@@ -20,7 +20,7 @@ function roleLabel(role) {
     case "reviewer": return "Review";
     case "assignee": return "Assignee";
     case "mentioned": return "@ Mentioned";
-    default: return role;
+    default: return role || "—";
   }
 }
 
@@ -230,13 +230,8 @@ function DetailPanel({ mr, onClose, onToggleUnread, onOpenGitLab, onRemindClick 
       <div className="dp-section">
         <div className="dp-label">Details</div>
         <div className="dp-row"><span className="dp-row-label">Author</span><span className="dp-row-val">{author.name}</span></div>
-        <div className="dp-row"><span className="dp-row-label">Your role</span><span className={`mr-pill ${mr.role}`} style={{ margin: 0 }}>{mr.role}</span></div>
-        <div className="dp-row">
-          <span className="dp-row-label">Pipeline</span>
-          <span className={`mr-pill pipe-${pipeline}`} style={{ margin: 0 }}>
-            {pipeline === "pass" ? "Passed" : pipeline === "fail" ? "Failed" : "Running"}
-          </span>
-        </div>
+        <div className="dp-row"><span className="dp-row-label">Your role</span><span className="dp-row-val">{roleLabel(mr.role)}</span></div>
+        <div className="dp-row"><span className="dp-row-label">Pipeline</span><span className="dp-row-val">{pipelineLabel(pipeline) || "—"}</span></div>
         <div className="dp-row"><span className="dp-row-label">Approvals</span><span className="dp-row-val">{approvals} / {needed}</span></div>
         <div className="dp-row"><span className="dp-row-label">Conflicts</span><span className="dp-row-val">{conflicts ? "Yes" : "None"}</span></div>
         {mr.reminder && (

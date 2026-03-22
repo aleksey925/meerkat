@@ -34,7 +34,7 @@ Meerkat lives in your system tray, periodically polls GitLab for MRs where you a
     make deps
     ```
 
-- run app in dev mode with hot reload `npm run tauri dev`
+- run app in dev mode with hot reload `make dev`
 
 ### Build
 
