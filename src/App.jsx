@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useAutoAnimate } from "@formkit/auto-animate/react";
 import "./App.css";
 import formatDateTime from "./utils/formatDateTime";
 import { useSettings } from "./hooks/useSettings";
@@ -427,6 +428,7 @@ function InboxView({
   sortBy, onSortChange,
 }) {
   const lastCheckedLabel = useRelativeTime(lastChecked);
+  const [listRef] = useAutoAnimate({ duration: 250 });
   const filtered = (() => {
     let list = selectedTab === "active" ? mergeRequests : resolved;
     if (selectedProject > 0) list = list.filter((m) => getProjectId(m) === selectedProject);
@@ -533,7 +535,7 @@ function InboxView({
 
       <div className="main-wrap">
         <div className="main-content">
-          <div className="mr-list">
+          <div className="mr-list" ref={listRef}>
             {loading ? (
               <div className="empty-state">
                 <div className="empty-icon">{"\u23F3"}</div>
