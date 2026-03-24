@@ -10,6 +10,7 @@ use tauri_plugin_store::StoreExt;
 use tokio::time::Duration;
 
 static POLLING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CHECK_CYCLE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_MRS: Mutex<Option<Vec<MergeRequest>>> = Mutex::new(None);
 
 fn detect_changes_and_notify(
@@ -115,7 +116,29 @@ fn check_and_fire_reminders(app: &AppHandle) {
     }
 }
 
-pub async fn run_check_cycle(app: &AppHandle) {
+pub async fn run_check_cycle(app: &AppHandle, manual: bool) -> Result<(), String> {
+    if CHECK_CYCLE_RUNNING.swap(true, Ordering::SeqCst) {
+        if manual {
+            let _ = app.emit("check-already-running", ());
+        }
+        return Ok(());
+    }
+
+    if manual {
+        let _ = app.emit("check-started", ());
+    }
+
+    let result = run_check_cycle_inner(app).await;
+
+    if manual {
+        let _ = app.emit("check-finished", result.is_ok());
+    }
+
+    CHECK_CYCLE_RUNNING.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn run_check_cycle_inner(app: &AppHandle) -> Result<(), String> {
     check_and_fire_reminders(app);
 
     match fetch_merge_requests(app.clone()).await {
@@ -132,12 +155,23 @@ pub async fn run_check_cycle(app: &AppHandle) {
             }
 
             let _ = app.emit("mr-update", &payload);
+            Ok(())
         }
         Err(e) => {
             log::warn!("Polling error: {}", e);
-            if e.contains("TOKEN_EXPIRED") {
-                let _ = app.emit("connection-error", "Token expired");
-            }
+            let user_message = if e.contains("TOKEN_EXPIRED") || e.contains("Invalid token") {
+                "Token expired. Update in Settings.".to_string()
+            } else if e.contains("not configured") {
+                e.clone()
+            } else if e.contains("Connection failed") {
+                "Connection failed. Check your network.".to_string()
+            } else if e.contains("Rate limited") {
+                "Rate limited by GitLab. Try again later.".to_string()
+            } else {
+                "Failed to update. Try again later.".to_string()
+            };
+            let _ = app.emit("connection-error", &user_message);
+            Err(user_message)
         }
     }
 }
@@ -167,7 +201,7 @@ pub fn start_polling_task(app: AppHandle) {
                 break;
             }
 
-            run_check_cycle(&app).await;
+            let _ = run_check_cycle(&app, false).await;
         }
     });
 }
@@ -186,6 +220,5 @@ pub fn stop_polling() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn check_now(app: AppHandle) -> Result<(), String> {
-    run_check_cycle(&app).await;
-    Ok(())
+    run_check_cycle(&app, true).await
 }

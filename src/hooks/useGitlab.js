@@ -53,9 +53,24 @@ export function useGitlab(showToast) {
     const listenPromise = getTauriListen();
     if (!listenPromise) return;
 
-    let unlistenMr, unlistenErr, unlistenReminders;
+    let unlistenMr, unlistenErr, unlistenReminders, unlistenCheckStarted, unlistenCheckFinished, unlistenCheckBusy;
 
     listenPromise.then((listen) => {
+      listen("check-started", () => {
+        setChecking(true);
+      }).then((fn) => { unlistenCheckStarted = fn; });
+
+      listen("check-finished", (event) => {
+        setChecking(false);
+        if (event.payload) {
+          showToast("Updated just now");
+        }
+      }).then((fn) => { unlistenCheckFinished = fn; });
+
+      listen("check-already-running", () => {
+        showToast("Update already in progress…");
+      }).then((fn) => { unlistenCheckBusy = fn; });
+
       listen("mr-update", (event) => {
         const payload = event.payload;
         setMergeRequests(payload.active);
@@ -80,6 +95,9 @@ export function useGitlab(showToast) {
     });
 
     return () => {
+      if (unlistenCheckStarted) unlistenCheckStarted();
+      if (unlistenCheckFinished) unlistenCheckFinished();
+      if (unlistenCheckBusy) unlistenCheckBusy();
       if (unlistenMr) unlistenMr();
       if (unlistenErr) unlistenErr();
       if (unlistenReminders) unlistenReminders();
@@ -184,19 +202,14 @@ export function useGitlab(showToast) {
   );
 
   const checkNow = useCallback(async () => {
-    if (checking) return;
     const invoke = getTauriInvoke();
     if (!invoke) return;
-    setChecking(true);
     try {
       await invoke("check_now");
-      showToast("Updated just now");
     } catch (e) {
       console.error("Failed to check now:", e);
-    } finally {
-      setChecking(false);
     }
-  }, [checking, showToast]);
+  }, []);
 
   const clearReminder = useCallback(
     async (id) => {

@@ -102,7 +102,7 @@ pub fn run() {
                         "check_now" => {
                             let handle = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                polling::run_check_cycle(&handle).await;
+                                let _ = polling::run_check_cycle(&handle, true).await;
                             });
                         }
                         "quit" => {
