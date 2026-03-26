@@ -18,7 +18,6 @@
         "minWidth": 800,
         "minHeight": 500,
         "decorations": true,
-        "titleBarStyle": "Overlay",
         "transparent": false,
         "resizable": true
       }

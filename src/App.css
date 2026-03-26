@@ -89,10 +89,7 @@ html, body {
   flex-direction: column;
   -webkit-backdrop-filter: blur(20px);
   backdrop-filter: blur(20px);
-  /* Tauri: make sidebar draggable as title bar */
-  -webkit-app-region: drag;
 }
-.sidebar * { -webkit-app-region: no-drag; }
 
 .sidebar-header {
   padding: 20px 16px 12px;
@@ -102,7 +99,7 @@ html, body {
   letter-spacing: 0.5px;
   color: var(--text-secondary);
 }
-.sidebar-header:first-child { padding-top: 28px; /* space for macOS traffic lights */ }
+.sidebar-header:first-child { padding-top: 20px; }
 
 .sidebar-section { padding: 0 8px; margin-bottom: 16px; }
 
