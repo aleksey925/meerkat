@@ -7,16 +7,6 @@ import { useGitlab } from "./hooks/useGitlab";
 import CustomReminderModal from "./components/CustomReminderModal";
 
 // ─── Utility Helpers ───────────────────────────────────────────────────────
-function statusDotColor(status) {
-  switch (status) {
-    case "open": return "var(--green)";
-    case "changes": return "var(--orange)";
-    case "approved": return "var(--accent)";
-    case "merged": return "var(--purple)";
-    default: return "var(--text-tertiary)";
-  }
-}
-
 function roleLabel(role) {
   switch (role) {
     case "reviewer": return "Review";
@@ -171,12 +161,11 @@ function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggl
 
   return (
     <div
-      className={`mr-card ${mr.unread ? "mr-card-new" : ""} ${isSelected ? "selected" : ""}`}
+      className={`mr-card${mr.unread ? " unread" : ""} ${isSelected ? "selected" : ""}`}
       onClick={() => onSelect(mr.id)}
       onContextMenu={(e) => { e.preventDefault(); onContextMenu(e, mr.id); }}
     >
       <div className="mr-top">
-        <div className="mr-status-dot" style={{ background: statusDotColor(mr.status) }} />
         <div className="mr-content">
           <div className="mr-title-row">
             <div className="mr-title">{mr.title}</div>
@@ -208,6 +197,7 @@ function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggl
             <span className="mr-branch">{mr.branch || `${mr.sourceBranch} \u2192 ${mr.targetBranch}`}</span>
           </div>
           <div className="mr-meta">
+            {mr.unread && <span className="mr-pill new">New</span>}
             <span className={`mr-pill ${mr.role}`}>{roleLabel(mr.role)}</span>
             {mr.draft && <span className="mr-pill draft">Draft</span>}
             {conflicts && <span className="mr-pill conflicts">Conflicts</span>}
