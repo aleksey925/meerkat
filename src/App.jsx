@@ -162,7 +162,7 @@ function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggl
   return (
     <div
       className={`mr-card${mr.unread ? " unread" : ""} ${isSelected ? "selected" : ""}`}
-      onClick={() => onSelect(mr.id)}
+      onClick={(e) => { e.stopPropagation(); onSelect(mr.id); }}
       onContextMenu={(e) => { e.preventDefault(); onContextMenu(e, mr.id); }}
     >
       <div className="mr-top">
@@ -218,7 +218,7 @@ function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggl
 }
 
 // ─── Detail Panel Component ────────────────────────────────────────────────
-function DetailPanel({ mr, onClose, onToggleUnread, onOpenGitLab, onRemindClick }) {
+function DetailPanel({ mr, closing, onClose, onAnimDone, onToggleUnread, onOpenGitLab, onRemindClick }) {
   const author = getAuthorInfo(mr);
   const pipeline = mr.pipelineStatus || mr.pipeline;
   const approvals = mr.approvalsCurrent ?? mr.approvals ?? 0;
@@ -226,7 +226,7 @@ function DetailPanel({ mr, onClose, onToggleUnread, onOpenGitLab, onRemindClick 
   const conflicts = mr.hasConflicts ?? mr.conflicts ?? false;
 
   return (
-    <div className="detail-panel">
+    <div className={`detail-panel${closing ? " closing" : ""}`} onAnimationEnd={closing ? onAnimDone : undefined} onClick={(e) => e.stopPropagation()}>
       <div className="dp-header">
         <div style={{ flex: 1 }}>
           <div className="dp-title">{mr.title}</div>
@@ -413,6 +413,7 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
 function InboxView({
   mergeRequests, projects, selectedProject, selectedRole,
   selectedMrId, searchQuery, loading, lastChecked, checking,
+  closingPanel, onClosePanel, onPanelAnimDone,
   onSelectProject, onSelectRole, onSelectMr,
   onSearch, onContextMenu, onToggleUnread, onOpenGitLab, onRemindClick, onCheckNow,
   sortBy, onSortChange,
@@ -545,7 +546,9 @@ function InboxView({
         {selectedMr && (
           <DetailPanel
             mr={selectedMr}
-            onClose={() => onSelectMr(null)}
+            closing={closingPanel}
+            onClose={onClosePanel}
+            onAnimDone={onPanelAnimDone}
             onToggleUnread={onToggleUnread}
             onOpenGitLab={onOpenGitLab}
             onRemindClick={onRemindClick}
@@ -568,6 +571,7 @@ export default function App() {
   const [notifPermission, setNotifPermission] = useState(null);
   const [ctxMenu, setCtxMenu] = useState(null);
   const [customReminderState, setCustomReminderState] = useState({ open: false, mrId: null, position: null });
+  const [closingPanel, setClosingPanel] = useState(false);
   const toastTimer = useRef(null);
 
   const showToast = useCallback((msg, duration = 2500) => {
@@ -654,9 +658,23 @@ export default function App() {
     gitlab.toggleUnread(id);
   }, [gitlab.toggleUnread]);
 
-  const handleSelectMr = useCallback((id) => {
-    setSelectedMrId((prev) => prev === id ? null : id);
+  const closePanel = useCallback(() => {
+    setClosingPanel((prev) => prev || true);
   }, []);
+
+  const onPanelAnimDone = useCallback(() => {
+    setClosingPanel(false);
+    setSelectedMrId(null);
+  }, []);
+
+  const handleSelectMr = useCallback((id) => {
+    if (id === null || id === selectedMrId) {
+      if (selectedMrId) closePanel();
+      return;
+    }
+    setClosingPanel(false);
+    setSelectedMrId(id);
+  }, [selectedMrId, closePanel]);
 
   const openGitLab = useCallback((mr) => {
     gitlab.openGitLab(mr);
@@ -715,7 +733,7 @@ export default function App() {
   const ctxMr = ctxMenu ? mergeRequests.find((m) => m.id === ctxMenu.mrId) : null;
 
   return (
-    <div className="app">
+    <div className="app" onClick={() => { if (selectedMrId) closePanel(); }}>
       <div className="sidebar">
         <div className="sidebar-header">Inbox</div>
         <div className="sidebar-section">
@@ -807,6 +825,9 @@ export default function App() {
           loading={gitlab.loading}
           lastChecked={gitlab.lastChecked}
           checking={gitlab.checking}
+          closingPanel={closingPanel}
+          onClosePanel={closePanel}
+          onPanelAnimDone={onPanelAnimDone}
           onSelectProject={setSelectedProject}
           onSelectRole={setSelectedRole}
           onSelectMr={handleSelectMr}

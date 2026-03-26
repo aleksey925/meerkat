@@ -306,6 +306,8 @@ html, body {
   }
 }
 @keyframes slideIn { from { transform: translateX(calc(100% + 8px)); } to { transform: translateX(0); } }
+@keyframes slideOut { from { transform: translateX(0); } to { transform: translateX(calc(100% + 8px)); } }
+.detail-panel.closing { animation: slideOut 0.2s ease forwards; }
 
 .dp-header { padding: 16px 20px; border-bottom: 0.5px solid var(--border); display: flex; align-items: flex-start; gap: 12px; }
 .dp-close {
