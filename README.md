@@ -1,9 +1,12 @@
 Meerkat
 =======
 
-A macOS menubar app for tracking GitLab merge requests. Built with Tauri 2, React, and Rust.
+A macOS menubar app for tracking GitLab merge requests.
 
-Meerkat lives in your system tray, periodically polls GitLab for MRs where you are a reviewer, assignee, or mentioned, and sends native macOS notifications when something changes.
+Meerkat lives in your system tray, periodically polls GitLab for MRs where you are a reviewer, 
+assignee, or mentioned, and sends notifications when something changes.
+
+> This application was generated using Claude Code with no manual code review. Only manual testing was performed.
 
 ## Features
 
