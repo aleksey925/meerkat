@@ -100,7 +100,6 @@ pub struct Settings {
 #[serde(rename_all = "camelCase")]
 pub struct MrUpdatePayload {
     pub active: Vec<MergeRequest>,
-    pub resolved: Vec<MergeRequest>,
     pub projects: Vec<Project>,
 }
 

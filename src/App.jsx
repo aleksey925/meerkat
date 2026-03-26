@@ -162,7 +162,7 @@ function ContextMenu({ mr, position, onClose, onToggleUnread, onSetReminder, onC
 }
 
 // ─── MR Card Component ─────────────────────────────────────────────────────
-function MrCard({ mr, isSelected, isResolved, onSelect, onContextMenu, onOpenGitLab, onToggleUnread }) {
+function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggleUnread }) {
   const author = getAuthorInfo(mr);
   const pipeline = mr.pipelineStatus || mr.pipeline;
   const approvals = mr.approvalsCurrent ?? mr.approvals ?? 0;
@@ -172,7 +172,7 @@ function MrCard({ mr, isSelected, isResolved, onSelect, onContextMenu, onOpenGit
   return (
     <div
       className={`mr-card ${mr.unread ? "mr-card-new" : ""} ${isSelected ? "selected" : ""}`}
-      onClick={() => !isResolved && onSelect(mr.id)}
+      onClick={() => onSelect(mr.id)}
       onContextMenu={(e) => { e.preventDefault(); onContextMenu(e, mr.id); }}
     >
       <div className="mr-top">
@@ -211,12 +211,12 @@ function MrCard({ mr, isSelected, isResolved, onSelect, onContextMenu, onOpenGit
             <span className={`mr-pill ${mr.role}`}>{roleLabel(mr.role)}</span>
             {mr.draft && <span className="mr-pill draft">Draft</span>}
             {conflicts && <span className="mr-pill conflicts">Conflicts</span>}
-            {(mr.status === "approved" || (approvals > 0 && !isResolved)) && (
+            {(mr.status === "approved" || approvals > 0) && (
               <span className="mr-pill approved">{"\u2713"} {approvals}/{needed}</span>
             )}
             {mr.status === "changes" && <span className="mr-pill changes">Changes requested</span>}
             {mr.status === "merged" && <span className="mr-pill merged">Merged</span>}
-            {pipeline && !isResolved && (
+            {pipeline && (
               <span className={`mr-pill pipe-${pipeline}`}>{pipelineLabel(pipeline)}</span>
             )}
             {mr.reminder && <span className="mr-pill reminder-pill">{"\u23F0"} {mr.reminder}</span>}
@@ -421,16 +421,16 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
 
 // ─── Inbox View Component ──────────────────────────────────────────────────
 function InboxView({
-  mergeRequests, resolved, projects, selectedProject, selectedRole,
-  selectedTab, selectedMrId, searchQuery, loading, lastChecked, checking,
-  onSelectProject, onSelectRole, onSelectTab, onSelectMr,
+  mergeRequests, projects, selectedProject, selectedRole,
+  selectedMrId, searchQuery, loading, lastChecked, checking,
+  onSelectProject, onSelectRole, onSelectMr,
   onSearch, onContextMenu, onToggleUnread, onOpenGitLab, onRemindClick, onCheckNow,
   sortBy, onSortChange,
 }) {
   const lastCheckedLabel = useRelativeTime(lastChecked);
   const [listRef] = useAutoAnimate({ duration: 250 });
   const filtered = (() => {
-    let list = selectedTab === "active" ? mergeRequests : resolved;
+    let list = mergeRequests;
     if (selectedProject > 0) list = list.filter((m) => getProjectId(m) === selectedProject);
     if (selectedRole !== "all") list = list.filter((m) => m.role === selectedRole);
     if (searchQuery) {
@@ -500,15 +500,6 @@ function InboxView({
         </div>
       </div>
 
-      <div className="tabs-bar">
-        <button className={`tab-btn ${selectedTab === "active" ? "active" : ""}`} onClick={() => onSelectTab("active")}>
-          Active<span className="tb-count">{mergeRequests.length}</span>
-        </button>
-        <button className={`tab-btn ${selectedTab === "resolved" ? "active" : ""}`} onClick={() => onSelectTab("resolved")}>
-          Resolved<span className="tb-count">{resolved.length}</span>
-        </button>
-      </div>
-
       <div className="filter-bar">
         <input
           className="search-box"
@@ -517,20 +508,18 @@ function InboxView({
           value={searchQuery}
           onChange={(e) => onSearch(e.target.value)}
         />
-        {selectedTab === "active" && (
-          <div className="sort-wrapper">
-            <span className="sort-icon">{"\u21C5"}</span>
-            <select
-              className="sort-select"
-              value={sortBy}
-              onChange={(e) => onSortChange(e.target.value)}
-              title="Sort order"
-            >
-              <option value="unread">Unread first</option>
-              <option value="updated">By update time</option>
-            </select>
-          </div>
-        )}
+        <div className="sort-wrapper">
+          <span className="sort-icon">{"\u21C5"}</span>
+          <select
+            className="sort-select"
+            value={sortBy}
+            onChange={(e) => onSortChange(e.target.value)}
+            title="Sort order"
+          >
+            <option value="unread">Unread first</option>
+            <option value="updated">By update time</option>
+          </select>
+        </div>
       </div>
 
       <div className="main-wrap">
@@ -554,7 +543,6 @@ function InboxView({
                   key={mr.id}
                   mr={mr}
                   isSelected={selectedMrId === mr.id}
-                  isResolved={selectedTab === "resolved"}
                   onSelect={onSelectMr}
                   onContextMenu={onContextMenu}
                   onOpenGitLab={onOpenGitLab}
@@ -583,7 +571,6 @@ export default function App() {
   const [view, setView] = useState("inbox");
   const [selectedProject, setSelectedProject] = useState(0);
   const [selectedRole, setSelectedRole] = useState("all");
-  const [selectedTab, setSelectedTab] = useState("active");
   const [selectedMrId, setSelectedMrId] = useState(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState("unread");
@@ -610,7 +597,6 @@ export default function App() {
   const gitlab = useGitlab(showToast);
 
   const mergeRequests = gitlab.mergeRequests;
-  const resolvedMrs = gitlab.resolved;
   const projects = gitlab.projects;
 
   useEffect(() => {
@@ -823,11 +809,9 @@ export default function App() {
       ) : (
         <InboxView
           mergeRequests={mergeRequests}
-          resolved={resolvedMrs}
           projects={projects}
           selectedProject={selectedProject}
           selectedRole={selectedRole}
-          selectedTab={selectedTab}
           selectedMrId={selectedMrId}
           searchQuery={searchQuery}
           loading={gitlab.loading}
@@ -835,7 +819,6 @@ export default function App() {
           checking={gitlab.checking}
           onSelectProject={setSelectedProject}
           onSelectRole={setSelectedRole}
-          onSelectTab={(tab) => { setSelectedTab(tab); setSelectedMrId(null); }}
           onSelectMr={handleSelectMr}
           onSearch={setSearchQuery}
           onContextMenu={handleContextMenu}

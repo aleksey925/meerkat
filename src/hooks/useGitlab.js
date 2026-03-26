@@ -16,7 +16,6 @@ function getTauriListen() {
 
 export function useGitlab(showToast) {
   const [mergeRequests, setMergeRequests] = useState([]);
-  const [resolved, setResolved] = useState([]);
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(false);
   const [offline, setOffline] = useState(false);
@@ -33,7 +32,6 @@ export function useGitlab(showToast) {
     try {
       const payload = await invoke("fetch_merge_requests");
       setMergeRequests(payload.active);
-      setResolved(payload.resolved);
       setProjects(payload.projects);
       setOffline(false);
       setLastChecked(new Date());
@@ -74,7 +72,6 @@ export function useGitlab(showToast) {
       listen("mr-update", (event) => {
         const payload = event.payload;
         setMergeRequests(payload.active);
-        setResolved(payload.resolved);
         setProjects(payload.projects);
         setOffline(false);
         setLastChecked(new Date());
@@ -234,7 +231,6 @@ export function useGitlab(showToast) {
 
   return {
     mergeRequests,
-    resolved,
     projects,
     loading,
     offline,

@@ -512,7 +512,6 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
 
     // Build MRs with details
     let mut active = Vec::new();
-    let mut resolved = Vec::new();
 
     for gl_mr in &all_gitlab_mrs {
         let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
@@ -539,7 +538,6 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
 
-        // persist the resolved state for future comparisons
         persist_read_state(&app, gl_mr.id, unread, &gl_mr.updated_at);
 
         let mr = MergeRequest {
@@ -567,19 +565,14 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             activity,
         };
 
-        match status {
-            MrStatus::Merged | MrStatus::Closed => resolved.push(mr),
-            _ => active.push(mr),
-        }
+        active.push(mr);
     }
 
     // Sort by updated_at desc
     active.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    resolved.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
     Ok(MrUpdatePayload {
         active,
-        resolved,
         projects,
     })
 }

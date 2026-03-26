@@ -190,15 +190,6 @@ html, body {
 }
 .seg-btn.active { background: var(--card-bg); color: var(--text-primary); }
 
-.tabs-bar { display: flex; gap: 0; padding: 0 20px; background: var(--card-bg); border-bottom: 0.5px solid var(--border); }
-.tab-btn {
-  padding: 10px 16px; font-size: 13px; font-weight: 500; border: none;
-  background: none; color: var(--text-secondary); cursor: pointer;
-  border-bottom: 2px solid transparent; transition: all 0.2s;
-}
-.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
-.tab-btn .tb-count { margin-left: 6px; font-size: 11px; background: var(--pill-bg); padding: 1px 7px; border-radius: 10px; }
-.tab-btn.active .tb-count { background: var(--accent-light); color: var(--accent); }
 
 .filter-bar {
   display: flex; align-items: center; gap: 8px; padding: 12px 20px 0;
