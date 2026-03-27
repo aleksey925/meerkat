@@ -65,20 +65,6 @@ pub async fn toggle_unread(app: AppHandle, mr_id: i64) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn mark_as_read(app: AppHandle, mr_id: i64) -> Result<(), String> {
-    let store = app
-        .store(READ_STATE_STORE)
-        .map_err(|e| format!("Store error: {e}"))?;
-
-    let key = mr_id.to_string();
-    let (_, updated_at) = read_state(&store, &key);
-
-    write_state(&store, &key, false, &updated_at);
-    store.save().map_err(|e| format!("Save error: {e}"))?;
-    Ok(())
-}
-
-#[tauri::command]
 pub fn update_tray_badge(app: AppHandle, count: usize) {
     crate::update_tray(&app, count);
 }

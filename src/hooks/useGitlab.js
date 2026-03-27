@@ -141,22 +141,6 @@ export function useGitlab(showToast) {
     [showToast],
   );
 
-  const markAsRead = useCallback(
-    async (id) => {
-      const invoke = getTauriInvoke();
-      if (!invoke) return;
-      try {
-        await invoke("mark_as_read", { mrId: id });
-        setMergeRequests((prev) =>
-          prev.map((m) => (m.id === id ? { ...m, unread: false } : m)),
-        );
-      } catch (e) {
-        console.error("Failed to mark as read:", e);
-      }
-    },
-    [],
-  );
-
   const openGitLab = useCallback(
     async (mr) => {
       const invoke = getTauriInvoke();
@@ -239,7 +223,6 @@ export function useGitlab(showToast) {
     startPolling,
     stopPolling,
     toggleUnread,
-    markAsRead,
     openGitLab,
     checking,
     checkNow,

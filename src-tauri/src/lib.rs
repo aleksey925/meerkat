@@ -2,7 +2,6 @@
 
 mod commands;
 mod credentials;
-mod db;
 mod models;
 mod notifications;
 mod polling;
@@ -67,11 +66,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(
-            tauri_plugin_sql::Builder::default()
-                .add_migrations(db::db_url(), db::migrations())
-                .build(),
-        )
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -139,15 +133,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::gitlab::test_connection,
             commands::gitlab::fetch_merge_requests,
-            commands::gitlab::get_projects,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::reminders::set_reminder,
             commands::reminders::clear_reminder,
-            commands::reminders::get_reminder,
             commands::system::open_in_browser,
             commands::system::toggle_unread,
-            commands::system::mark_as_read,
             commands::system::update_tray_badge,
             commands::system::check_notification_permission,
             commands::system::prompt_notification_permission,

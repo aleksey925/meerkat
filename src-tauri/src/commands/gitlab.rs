@@ -576,9 +576,3 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         projects,
     })
 }
-
-#[tauri::command]
-pub async fn get_projects(app: AppHandle) -> Result<Vec<Project>, String> {
-    let payload = fetch_merge_requests(app).await?;
-    Ok(payload.projects)
-}
