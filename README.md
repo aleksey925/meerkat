@@ -20,6 +20,19 @@ assignee, or mentioned, and sends notifications when something changes.
 - Light and dark theme (follows system)
 
 
+## Installation
+
+Download the latest release from [releases](https://github.com/aleksey925/meerkat/releases) 
+and install it manually.
+
+> **Note:** Release builds are not signed with an Apple Developer certificate, so macOS Gatekeeper 
+> will show a warning that the app is damaged or can't be opened. To fix this, run:
+> ```bash
+> xattr -cr /Applications/Meerkat.app
+> ```
+> Alternatively, you can [build from source](#build) on your machine to avoid this issue.
+
+
 ## Development
 
 **Prerequisites**
@@ -48,11 +61,3 @@ make build
 ```
 
 > `.app` bundle will be at `src-tauri/target/release/bundle/macos/`.
-
-> If you transfer a built app to another PC, you may receive a message 
-> saying the app is broken and should be removed. This happens because 
-> the app is not signed. 
-> To fix it, run the following command: 
-> ```bash 
-> xattr -cr /Applications/Meerkat.app
-> ```
