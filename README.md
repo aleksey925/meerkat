@@ -52,4 +52,7 @@ make build
 > If you transfer a built app to another PC, you may receive a message 
 > saying the app is broken and should be removed. This happens because 
 > the app is not signed. 
-> To fix it, run the following command: `xattr -cr /Applications/Meerkat.app`.
+> To fix it, run the following command: 
+> ```bash 
+> xattr -cr /Applications/Meerkat.app
+> ```

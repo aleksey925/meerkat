@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
 import "./App.css";
 import formatDateTime from "./utils/formatDateTime";
@@ -275,7 +276,7 @@ function DetailPanel({ mr, closing, onClose, onAnimDone, onToggleUnread, onOpenG
 }
 
 // ─── Settings View Component ───────────────────────────────────────────────
-function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermission, onNotifPermissionChange, showToast }) {
+function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermission, onNotifPermissionChange, showToast, appVersion }) {
   const update = (key, value) => onUpdate({ ...settings, [key]: value });
   const saveField = (key, value) => {
     const next = { ...settings, [key]: value };
@@ -404,6 +405,7 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
           </div>
         </div>
 
+        <div className="settings-version">Meerkat v{appVersion}</div>
       </div>
     </div>
   );
@@ -572,7 +574,10 @@ export default function App() {
   const [ctxMenu, setCtxMenu] = useState(null);
   const [customReminderState, setCustomReminderState] = useState({ open: false, mrId: null, position: null });
   const [closingPanel, setClosingPanel] = useState(false);
+  const [appVersion, setAppVersion] = useState("0.0.0");
   const toastTimer = useRef(null);
+
+  useEffect(() => { getVersion().then(setAppVersion); }, []);
 
   const showToast = useCallback((msg, duration = 2500) => {
     setToast(msg);
@@ -799,6 +804,7 @@ export default function App() {
           notifPermission={notifPermission}
           onNotifPermissionChange={setNotifPermission}
           showToast={showToast}
+          appVersion={appVersion}
         />
       ) : !settings.connected ? (
         <div className="main">

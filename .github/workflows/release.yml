@@ -32,7 +32,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('mise.toml', 'src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
 
       - name: Install dependencies
         run: make deps
