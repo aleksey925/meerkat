@@ -19,13 +19,29 @@ jobs:
       - name: Setup mise
         uses: jdx/mise-action@v2
 
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+
       - name: Install dependencies
         run: make deps
 
       - name: Build
         run: VER="${GITHUB_REF_NAME#v}" make build
 
-      - name: Create release and upload DMG
-        run: gh release create "$GITHUB_REF_NAME" src-tauri/target/release/bundle/dmg/*.dmg --generate-notes
+      - name: Upload DMG to release
+        run: |
+          gh release upload "$GITHUB_REF_NAME" src-tauri/target/release/bundle/dmg/*.dmg --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
