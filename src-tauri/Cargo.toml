@@ -1,6 +1,6 @@
 [package]
 name = "meerkat"
-version = "0.1.0"
+version = "0.0.0"
 description = "Meerkat - Desktop notification app for tracking GitLab merge requests"
 authors = ["you"]
 license = ""
