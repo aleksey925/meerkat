@@ -23,11 +23,9 @@ jobs:
         run: make deps
 
       - name: Build
-        run: make build
-        env:
-          VER: ${GITHUB_REF_NAME#v}
+        run: VER="${GITHUB_REF_NAME#v}" make build
 
-      - name: Upload DMG to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: src-tauri/target/release/bundle/dmg/*.dmg
+      - name: Create release and upload DMG
+        run: gh release create "$GITHUB_REF_NAME" src-tauri/target/release/bundle/dmg/*.dmg --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
