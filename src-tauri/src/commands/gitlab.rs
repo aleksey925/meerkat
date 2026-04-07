@@ -219,12 +219,19 @@ async fn fetch_pipeline_status(
     })
 }
 
+struct ApprovalInfo {
+    current: u32,
+    required: u32,
+    approved_by_me: bool,
+}
+
 async fn fetch_approvals(
     client: &Client,
     base_url: &str,
     project_id: i64,
     mr_iid: i64,
-) -> (u32, u32) {
+    current_uid: i64,
+) -> ApprovalInfo {
     let url = format!(
         "{}/api/v4/projects/{}/merge_requests/{}/approvals",
         base_url, project_id, mr_iid
@@ -232,22 +239,20 @@ async fn fetch_approvals(
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(_) => return (0, 0),
+        Err(_) => return ApprovalInfo { current: 0, required: 0, approved_by_me: false },
     };
 
     let approvals: GitLabApprovals = match resp.json().await {
         Ok(a) => a,
-        Err(_) => return (0, 0),
+        Err(_) => return ApprovalInfo { current: 0, required: 0, approved_by_me: false },
     };
 
-    let current = approvals
-        .approved_by
-        .as_ref()
-        .map(|v| v.len() as u32)
-        .unwrap_or(0);
+    let approved_by = approvals.approved_by.as_deref().unwrap_or_default();
+    let current = approved_by.len() as u32;
     let required = approvals.approvals_required.unwrap_or(0) as u32;
+    let approved_by_me = approved_by.iter().any(|a| a.user.id == current_uid);
 
-    (current, required)
+    ApprovalInfo { current, required, approved_by_me }
 }
 
 async fn fetch_notes(
@@ -257,7 +262,7 @@ async fn fetch_notes(
     mr_iid: i64,
 ) -> Vec<GitLabNote> {
     let url = format!(
-        "{}/api/v4/projects/{}/merge_requests/{}/notes?sort=asc&per_page=50",
+        "{}/api/v4/projects/{}/merge_requests/{}/notes?sort=desc&per_page=50",
         base_url, project_id, mr_iid
     );
 
@@ -341,7 +346,7 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
         color: "#5e5ce6".to_string(),
     });
 
-    for note in notes.iter().take(20) {
+    for note in notes.iter().rev().take(20) {
         let is_system = note.system.unwrap_or(false);
         events.push(ActivityEvent {
             who: if is_system {
@@ -366,10 +371,30 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
     events
 }
 
+fn has_new_activity_from_others(
+    notes: &[GitLabNote],
+    current_username: &str,
+    since: &str,
+) -> bool {
+    // notes are sorted desc (newest first)
+    for note in notes {
+        if note.created_at.as_str() <= since {
+            break;
+        }
+        if note.author.username != current_username {
+            return true;
+        }
+    }
+    false
+}
+
 fn resolve_unread_status(
     app: &AppHandle,
     mr_id: i64,
     updated_at: &str,
+    notes: &[GitLabNote],
+    current_username: &str,
+    approved_by_me: bool,
 ) -> bool {
     let read_store = app.store("mr_read_state.json").ok();
     let key = mr_id.to_string();
@@ -386,9 +411,15 @@ fn resolve_unread_status(
                     .get("updatedAt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                // if updated_at changed since last store, mark unread again
                 if stored_updated != updated_at {
-                    return true;
+                    if has_new_activity_from_others(notes, current_username, stored_updated) {
+                        return true;
+                    }
+                    // no new activity from others — auto-read if approved by me
+                    if approved_by_me {
+                        return false;
+                    }
+                    return stored_unread;
                 }
                 return stored_unread;
             }
@@ -398,7 +429,10 @@ fn resolve_unread_status(
             }
         }
     }
-    // new MR — unread
+    // new MR — auto-read if already approved by me
+    if approved_by_me {
+        return false;
+    }
     true
 }
 
@@ -515,12 +549,12 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
 
     for gl_mr in &all_gitlab_mrs {
         let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
-        let (approvals_current, approvals_required) =
-            fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let approval_info =
+            fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
         let pipeline =
             fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
         let role = determine_role(gl_mr, uid, &username, &notes);
-        let status = determine_status(gl_mr, approvals_current, approvals_required);
+        let status = determine_status(gl_mr, approval_info.current, approval_info.required);
         let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
 
         let proj = project_cache.get(&gl_mr.project_id);
@@ -531,7 +565,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
 
         let activity = notes_to_activity(&notes, gl_mr);
 
-        let unread = resolve_unread_status(&app, gl_mr.id, &gl_mr.updated_at);
+        let unread = resolve_unread_status(&app, gl_mr.id, &gl_mr.updated_at, &notes, &username, approval_info.approved_by_me);
         let reminder = resolve_reminder(&app, gl_mr.id);
 
         let updated_at = chrono::DateTime::parse_from_rfc3339(&gl_mr.updated_at)
@@ -556,8 +590,8 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             draft: is_draft,
             has_conflicts: gl_mr.has_conflicts.unwrap_or(false),
             pipeline_status: pipeline,
-            approvals_current,
-            approvals_required,
+            approvals_current: approval_info.current,
+            approvals_required: approval_info.required,
             web_url: gl_mr.web_url.clone(),
             updated_at,
             unread,
