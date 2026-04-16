@@ -143,6 +143,7 @@ pub fn run() {
             commands::system::check_notification_permission,
             commands::system::prompt_notification_permission,
             commands::system::send_test_notification,
+            commands::system::get_app_version,
             polling::start_polling,
             polling::stop_polling,
             polling::check_now,

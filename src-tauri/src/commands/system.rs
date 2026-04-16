@@ -83,3 +83,14 @@ pub fn prompt_notification_permission(app: AppHandle) {
 pub fn send_test_notification(app: AppHandle) {
     crate::notifications::send_notification(&app, "Meerkat", "Test notification — everything works!");
 }
+
+#[tauri::command]
+pub fn get_app_version(app: AppHandle) -> String {
+    let version = app.config().version.clone().unwrap_or_else(|| "unknown".to_string());
+    let hash = env!("COMMIT_HASH");
+    if hash.is_empty() {
+        version
+    } else {
+        format!("{version} ({hash})")
+    }
+}
