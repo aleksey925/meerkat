@@ -61,6 +61,8 @@ pub struct MergeRequest {
     pub unread: bool,
     pub reminder: Option<String>,
     pub activity: Vec<ActivityEvent>,
+    #[serde(skip)]
+    pub latest_actor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

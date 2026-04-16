@@ -371,21 +371,26 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
     events
 }
 
-fn has_new_activity_from_others(
+fn find_latest_activity_from_others(
     notes: &[GitLabNote],
     current_username: &str,
     since: &str,
-) -> bool {
+) -> Option<String> {
     // notes are sorted desc (newest first)
     for note in notes {
         if note.created_at.as_str() <= since {
             break;
         }
         if note.author.username != current_username {
-            return true;
+            return Some(note.author.name.clone());
         }
     }
-    false
+    None
+}
+
+struct ReadStatus {
+    unread: bool,
+    latest_actor: Option<String>,
 }
 
 fn resolve_unread_status(
@@ -395,7 +400,7 @@ fn resolve_unread_status(
     notes: &[GitLabNote],
     current_username: &str,
     approved_by_me: bool,
-) -> bool {
+) -> ReadStatus {
     let read_store = app.store("mr_read_state.json").ok();
     let key = mr_id.to_string();
 
@@ -412,28 +417,30 @@ fn resolve_unread_status(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if stored_updated != updated_at {
-                    if has_new_activity_from_others(notes, current_username, stored_updated) {
-                        return true;
+                    let latest_actor =
+                        find_latest_activity_from_others(notes, current_username, stored_updated);
+                    if latest_actor.is_some() {
+                        return ReadStatus { unread: true, latest_actor };
                     }
                     // no new activity from others — auto-read if approved by me
                     if approved_by_me {
-                        return false;
+                        return ReadStatus { unread: false, latest_actor: None };
                     }
-                    return stored_unread;
+                    return ReadStatus { unread: stored_unread, latest_actor: None };
                 }
-                return stored_unread;
+                return ReadStatus { unread: stored_unread, latest_actor: None };
             }
             // legacy format: just a bool (false = read)
             if let Some(unread_val) = val.as_bool() {
-                return unread_val;
+                return ReadStatus { unread: unread_val, latest_actor: None };
             }
         }
     }
     // new MR — auto-read if already approved by me
     if approved_by_me {
-        return false;
+        return ReadStatus { unread: false, latest_actor: None };
     }
-    true
+    ReadStatus { unread: true, latest_actor: None }
 }
 
 fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
@@ -565,14 +572,14 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
 
         let activity = notes_to_activity(&notes, gl_mr);
 
-        let unread = resolve_unread_status(&app, gl_mr.id, &gl_mr.updated_at, &notes, &username, approval_info.approved_by_me);
+        let read_status = resolve_unread_status(&app, gl_mr.id, &gl_mr.updated_at, &notes, &username, approval_info.approved_by_me);
         let reminder = resolve_reminder(&app, gl_mr.id);
 
         let updated_at = chrono::DateTime::parse_from_rfc3339(&gl_mr.updated_at)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
 
-        persist_read_state(&app, gl_mr.id, unread, &gl_mr.updated_at);
+        persist_read_state(&app, gl_mr.id, read_status.unread, &gl_mr.updated_at);
 
         let mr = MergeRequest {
             id: gl_mr.id,
@@ -594,9 +601,10 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             approvals_required: approval_info.required,
             web_url: gl_mr.web_url.clone(),
             updated_at,
-            unread,
+            unread: read_status.unread,
             reminder,
             activity,
+            latest_actor: read_status.latest_actor,
         };
 
         active.push(mr);

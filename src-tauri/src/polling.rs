@@ -32,7 +32,9 @@ fn detect_changes_and_notify(
             }
             Some(prev_mr) => {
                 if mr.updated_at != prev_mr.updated_at {
-                    notifications::notify_mr_updated(app, &mr.author_name, &mr.title);
+                    if let Some(ref actor) = mr.latest_actor {
+                        notifications::notify_mr_updated(app, actor, &mr.title);
+                    }
                 }
                 if mr.pipeline_status == Some(PipelineStatus::Fail)
                     && prev_mr.pipeline_status != Some(PipelineStatus::Fail)

@@ -117,7 +117,7 @@ pub fn notify_mr_updated(app: &AppHandle, author: &str, title: &str) {
     send_notification(
         app,
         "MR updated",
-        &format!("{} pushed to '{}'", author, title),
+        &format!("{} updated '{}'", author, title),
     );
 }
 
