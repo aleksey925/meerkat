@@ -34,3 +34,9 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"], default-features = false }
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
