@@ -339,7 +339,7 @@ fn color_for_project(index: usize) -> &'static str {
 }
 
 fn make_initials(name: &str) -> String {
-    name.split(|c: char| c == '-' || c == '_' || c == ' ')
+    name.split(['-', '_', ' '])
         .filter(|s| !s.is_empty())
         .take(2)
         .map(|s| s.chars().next().unwrap_or('?').to_uppercase().to_string())
@@ -593,7 +593,7 @@ fn persist_read_state(
 ) {
     if let Ok(store) = app.store("mr_read_state.json") {
         store.set(
-            &mr_id.to_string(),
+            mr_id.to_string(),
             serde_json::json!({
                 "unread": unread,
                 "updatedAt": updated_at,
@@ -652,8 +652,8 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
 
     for mr in reviewer_mrs
         .into_iter()
-        .chain(assignee_mrs.into_iter())
-        .chain(mentioned_mrs.into_iter())
+        .chain(assignee_mrs)
+        .chain(mentioned_mrs)
     {
         if seen.insert(mr.id) {
             all_gitlab_mrs.push(mr);
@@ -760,7 +760,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
     }
 
     // Sort by updated_at desc
-    active.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    active.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
     Ok(MrUpdatePayload { active, projects })
 }

@@ -167,7 +167,7 @@ async fn run_check_cycle_inner(app: &AppHandle) -> Result<(), String> {
         Ok(payload) => {
             {
                 let prev = PREVIOUS_MRS.lock().ok();
-                if let Some(ref prev_data) = prev.as_ref().and_then(|o| o.as_ref()) {
+                if let Some(prev_data) = prev.as_ref().and_then(|o| o.as_ref()) {
                     detect_changes_and_notify(app, &payload.active, prev_data);
                 }
             }

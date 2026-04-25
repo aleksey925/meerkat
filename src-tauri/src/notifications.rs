@@ -1,4 +1,6 @@
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(target_os = "macos")]
+use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_store::StoreExt;
 

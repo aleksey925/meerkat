@@ -13,7 +13,7 @@ pub async fn set_reminder(
         .map_err(|e| format!("Store error: {e}"))?;
 
     store.set(
-        &mr_id.to_string(),
+        mr_id.to_string(),
         serde_json::json!({"at": at, "label": label}),
     );
     store.save().map_err(|e| format!("Save error: {e}"))?;
@@ -26,7 +26,7 @@ pub async fn clear_reminder(app: AppHandle, mr_id: i64) -> Result<(), String> {
         .store("reminders.json")
         .map_err(|e| format!("Store error: {e}"))?;
 
-    store.delete(&mr_id.to_string());
+    store.delete(mr_id.to_string());
     store.save().map_err(|e| format!("Save error: {e}"))?;
     Ok(())
 }

@@ -6,7 +6,9 @@ mod models;
 mod notifications;
 mod polling;
 
-use tauri::{Emitter, Listener, Manager, RunEvent};
+use tauri::{Emitter, Listener, Manager};
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
 
 #[cfg(target_os = "macos")]
 static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
