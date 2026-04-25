@@ -21,17 +21,15 @@ jobs:
         uses: jdx/mise-action@v2
 
       - name: Sync rust toolchain
-        # mise sets RUSTUP_TOOLCHAIN which overrides rust-toolchain.toml, so unset it here
-        # to let rustup read the channel and components from the file
-        run: env -u RUSTUP_TOOLCHAIN rustup install
+        run: rustup component add rustfmt clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
-      - name: Test
-        run: make test
-
       - name: Lint
         run: make lint
+
+      - name: Test
+        run: make test
