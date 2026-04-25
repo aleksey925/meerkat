@@ -53,6 +53,12 @@ and install it manually.
   make deps
   ```
 
+- verify the setup by running tests
+
+  ```bash
+  make test
+  ```
+
 Now you can run the app in dev mode with hot reload using `make dev`.
 
 ### Build
