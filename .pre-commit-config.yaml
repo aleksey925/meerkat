@@ -1,0 +1,37 @@
+repos:
+  - repo: builtin
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        exclude: helm|helmfile.yaml
+      - id: detect-private-key
+      - id: check-yaml
+        exclude: helm|helmfile.yaml
+
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.21.0
+    hooks:
+      - id: yamlfmt
+        args: [-formatter, retain_line_breaks_single=true]
+        exclude: helm|helmfile.yaml
+
+  - repo: local
+    hooks:
+      - id: prettier
+        name: prettier
+        language: system
+        entry: prettier --write
+        files: ^README\.md$
+
+      - id: rustfmt
+        name: rustfmt
+        language: system
+        entry: cargo fmt --manifest-path src-tauri/Cargo.toml --
+        files: ^src-tauri/.*\.rs$
+
+      - id: clippy
+        name: clippy
+        language: system
+        entry: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --tests -- -D warnings
+        files: ^src-tauri/.*\.rs$
+        pass_filenames: false

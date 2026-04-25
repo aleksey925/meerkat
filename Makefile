@@ -14,3 +14,6 @@ build:
 
 test:
 	cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+lint:
+	@prek run --all-files

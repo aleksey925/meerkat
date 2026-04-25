@@ -16,7 +16,9 @@ static PREVIOUS_MRS: Mutex<Option<Vec<MergeRequest>>> = Mutex::new(None);
 pub(crate) fn previous_mr_updated_at_raw(mr_id: i64) -> Option<String> {
     let prev = PREVIOUS_MRS.lock().ok()?;
     let mrs = prev.as_ref()?;
-    mrs.iter().find(|m| m.id == mr_id).map(|m| m.updated_at_raw.clone())
+    mrs.iter()
+        .find(|m| m.id == mr_id)
+        .map(|m| m.updated_at_raw.clone())
 }
 
 fn detect_changes_and_notify(
@@ -29,12 +31,7 @@ fn detect_changes_and_notify(
     for mr in new_active {
         match prev_map.get(&mr.id) {
             None => {
-                notifications::notify_new_mr(
-                    app,
-                    &mr.author_name,
-                    &mr.title,
-                    &mr.project_name,
-                );
+                notifications::notify_new_mr(app, &mr.author_name, &mr.title, &mr.project_name);
             }
             Some(prev_mr) => {
                 if mr.updated_at != prev_mr.updated_at {
@@ -117,8 +114,11 @@ fn check_and_fire_reminders(app: &AppHandle) {
                     read_store
                         .get(&key)
                         .and_then(|v| {
-                            v.as_object()
-                                .and_then(|o| o.get("updatedAt").and_then(|u| u.as_str()).map(String::from))
+                            v.as_object().and_then(|o| {
+                                o.get("updatedAt")
+                                    .and_then(|u| u.as_str())
+                                    .map(String::from)
+                            })
                         })
                         .unwrap_or_default()
                 };
@@ -212,7 +212,10 @@ pub fn start_polling_task(app: AppHandle) {
             let poll_secs = {
                 let store = app.store("settings.json").ok();
                 store
-                    .and_then(|s| s.get("poll_interval").and_then(|v| v.as_str().map(String::from)))
+                    .and_then(|s| {
+                        s.get("poll_interval")
+                            .and_then(|v| v.as_str().map(String::from))
+                    })
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(30)
             };

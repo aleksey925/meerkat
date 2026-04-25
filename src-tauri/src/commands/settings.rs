@@ -40,9 +40,7 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
         .unwrap_or(true);
 
     let has_token = credentials::get_token()?.is_some();
-    let connected = has_token
-        && store.get("user_id").is_some()
-        && !url.is_empty();
+    let connected = has_token && store.get("user_id").is_some() && !url.is_empty();
 
     let token_display = if has_token {
         credentials::get_token()?.and_then(|t| if t.is_empty() { None } else { Some(t) })
@@ -69,19 +67,10 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), Str
         .map_err(|e| format!("Store error: {e}"))?;
 
     store.set("gitlab_url", serde_json::json!(settings.url));
-    store.set(
-        "poll_interval",
-        serde_json::json!(settings.poll_interval),
-    );
+    store.set("poll_interval", serde_json::json!(settings.poll_interval));
     store.set("show_drafts", serde_json::json!(settings.show_drafts));
-    store.set(
-        "show_mentions",
-        serde_json::json!(settings.show_mentions),
-    );
-    store.set(
-        "desktop_notif",
-        serde_json::json!(settings.desktop_notif),
-    );
+    store.set("show_mentions", serde_json::json!(settings.show_mentions));
+    store.set("desktop_notif", serde_json::json!(settings.desktop_notif));
     store.set("sound_notif", serde_json::json!(settings.sound_notif));
     store.save().map_err(|e| format!("Save error: {e}"))?;
 

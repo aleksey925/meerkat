@@ -22,16 +22,27 @@ pub fn check_permission() -> bool {
         }
     };
 
-    let Some(apps) = data.as_dictionary().and_then(|d| d.get("apps")).and_then(|a| a.as_array()) else {
+    let Some(apps) = data
+        .as_dictionary()
+        .and_then(|d| d.get("apps"))
+        .and_then(|a| a.as_array())
+    else {
         log::warn!("No apps array in ncprefs.plist");
         return true;
     };
 
     for app in apps {
-        let Some(dict) = app.as_dictionary() else { continue };
-        let Some(bid) = dict.get("bundle-id").and_then(|b| b.as_string()) else { continue };
+        let Some(dict) = app.as_dictionary() else {
+            continue;
+        };
+        let Some(bid) = dict.get("bundle-id").and_then(|b| b.as_string()) else {
+            continue;
+        };
         if bid == BUNDLE_ID {
-            let auth = dict.get("auth").and_then(|a| a.as_signed_integer()).unwrap_or(0);
+            let auth = dict
+                .get("auth")
+                .and_then(|a| a.as_signed_integer())
+                .unwrap_or(0);
             log::info!("Notification permission for {BUNDLE_ID}: auth={auth}");
             return auth > 0;
         }
@@ -50,7 +61,9 @@ pub fn check_permission() -> bool {
 pub fn prompt_permission(app: &AppHandle) {
     if !check_permission() {
         log::info!("Permission not granted, sending trigger notification...");
-        let _ = app.notification().builder()
+        let _ = app
+            .notification()
+            .builder()
             .title("Meerkat")
             .body("Please allow notifications to get alerts about merge requests.")
             .show();
@@ -122,11 +135,7 @@ pub fn notify_mr_updated(app: &AppHandle, author: &str, title: &str) {
 }
 
 pub fn notify_pipeline_failed(app: &AppHandle, title: &str) {
-    send_notification(
-        app,
-        "Pipeline failed",
-        &format!("CI failed on '{}'", title),
-    );
+    send_notification(app, "Pipeline failed", &format!("CI failed on '{}'", title));
 }
 
 pub fn notify_reminder(app: &AppHandle, title: &str) {

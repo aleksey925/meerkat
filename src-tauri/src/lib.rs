@@ -9,8 +9,7 @@ mod polling;
 use tauri::{Emitter, Listener, Manager, RunEvent};
 
 #[cfg(target_os = "macos")]
-static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(desktop)]
 pub fn update_tray(handle: &tauri::AppHandle, unread: usize) {
@@ -39,9 +38,7 @@ pub fn focus_main_window(app: &tauri::AppHandle) {
 }
 
 #[cfg(desktop)]
-fn build_tray_menu(
-    app: &tauri::AppHandle,
-) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
+fn build_tray_menu(app: &tauri::AppHandle) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 
     let open_item = MenuItemBuilder::with_id("open", "Open").build(app)?;
@@ -126,7 +123,9 @@ pub fn run() {
                 let _ = window.hide();
                 #[cfg(target_os = "macos")]
                 {
-                    let _ = window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
             }
         })
@@ -158,7 +157,10 @@ pub fn run() {
             // hidden window when the app transitions from inactive to active.
             #[cfg(target_os = "macos")]
             match &event {
-                RunEvent::Reopen { has_visible_windows, .. } => {
+                RunEvent::Reopen {
+                    has_visible_windows,
+                    ..
+                } => {
                     if !has_visible_windows {
                         focus_main_window(app_handle);
                     }
@@ -170,7 +172,8 @@ pub fn run() {
                         let mtm = objc2::MainThreadMarker::new_unchecked();
                         NSApplication::sharedApplication(mtm).isActive()
                     };
-                    let was_inactive = APP_WAS_INACTIVE.swap(!is_active, std::sync::atomic::Ordering::Relaxed);
+                    let was_inactive =
+                        APP_WAS_INACTIVE.swap(!is_active, std::sync::atomic::Ordering::Relaxed);
                     if is_active && was_inactive {
                         if let Some(window) = app_handle.get_webview_window("main") {
                             if !window.is_visible().unwrap_or(true) {

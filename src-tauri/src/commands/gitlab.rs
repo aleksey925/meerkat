@@ -121,10 +121,7 @@ async fn fetch_mrs_by_scope(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
 
-        let mrs: Vec<GitLabMr> = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {e}"))?;
+        let mrs: Vec<GitLabMr> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         if mrs.is_empty() {
             break;
@@ -172,10 +169,7 @@ async fn fetch_mentioned_mrs(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
 
-        let mrs: Vec<GitLabMr> = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {e}"))?;
+        let mrs: Vec<GitLabMr> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         if mrs.is_empty() {
             break;
@@ -239,12 +233,24 @@ async fn fetch_approvals(
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(_) => return ApprovalInfo { current: 0, required: 0, approved_by_me: false },
+        Err(_) => {
+            return ApprovalInfo {
+                current: 0,
+                required: 0,
+                approved_by_me: false,
+            }
+        }
     };
 
     let approvals: GitLabApprovals = match resp.json().await {
         Ok(a) => a,
-        Err(_) => return ApprovalInfo { current: 0, required: 0, approved_by_me: false },
+        Err(_) => {
+            return ApprovalInfo {
+                current: 0,
+                required: 0,
+                approved_by_me: false,
+            }
+        }
     };
 
     let approved_by = approvals.approved_by.as_deref().unwrap_or_default();
@@ -252,7 +258,11 @@ async fn fetch_approvals(
     let required = approvals.approvals_required.unwrap_or(0) as u32;
     let approved_by_me = approved_by.iter().any(|a| a.user.id == current_uid);
 
-    ApprovalInfo { current, required, approved_by_me }
+    ApprovalInfo {
+        current,
+        required,
+        approved_by_me,
+    }
 }
 
 async fn fetch_notes(
@@ -686,21 +696,25 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
         let approval_info =
             fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
-        let pipeline =
-            fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let pipeline = fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
         let role = determine_role(gl_mr, uid, &username, &notes);
         let status = determine_status(gl_mr, approval_info.current, approval_info.required);
         let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
 
         let proj = project_cache.get(&gl_mr.project_id);
         let project_name = proj.map(|p| p.name.clone()).unwrap_or_default();
-        let project_namespace = proj
-            .map(|p| p.namespace.name.clone())
-            .unwrap_or_default();
+        let project_namespace = proj.map(|p| p.namespace.name.clone()).unwrap_or_default();
 
         let activity = notes_to_activity(&notes, gl_mr);
 
-        let read_status = resolve_unread_status(&app, gl_mr.id, &gl_mr.updated_at, &notes, &username, approval_info.approved_by_me);
+        let read_status = resolve_unread_status(
+            &app,
+            gl_mr.id,
+            &gl_mr.updated_at,
+            &notes,
+            &username,
+            approval_info.approved_by_me,
+        );
         let reminder = resolve_reminder(&app, gl_mr.id);
 
         let updated_at = chrono::DateTime::parse_from_rfc3339(&gl_mr.updated_at)
@@ -748,10 +762,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
     // Sort by updated_at desc
     active.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
-    Ok(MrUpdatePayload {
-        active,
-        projects,
-    })
+    Ok(MrUpdatePayload { active, projects })
 }
 
 #[cfg(test)]

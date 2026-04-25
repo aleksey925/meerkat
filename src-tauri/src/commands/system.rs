@@ -9,10 +9,7 @@ fn read_state(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str) -> (bool
         .get(key)
         .map(|v| {
             if let Some(obj) = v.as_object() {
-                let unread = obj
-                    .get("unread")
-                    .and_then(|u| u.as_bool())
-                    .unwrap_or(true);
+                let unread = obj.get("unread").and_then(|u| u.as_bool()).unwrap_or(true);
                 let at = obj
                     .get("updatedAt")
                     .and_then(|u| u.as_str())
@@ -89,12 +86,20 @@ pub fn prompt_notification_permission(app: AppHandle) {
 
 #[tauri::command]
 pub fn send_test_notification(app: AppHandle) {
-    crate::notifications::send_notification(&app, "Meerkat", "Test notification — everything works!");
+    crate::notifications::send_notification(
+        &app,
+        "Meerkat",
+        "Test notification — everything works!",
+    );
 }
 
 #[tauri::command]
 pub fn get_app_version(app: AppHandle) -> String {
-    let version = app.config().version.clone().unwrap_or_else(|| "unknown".to_string());
+    let version = app
+        .config()
+        .version
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     let hash = env!("COMMIT_HASH");
     if hash.is_empty() {
         version
