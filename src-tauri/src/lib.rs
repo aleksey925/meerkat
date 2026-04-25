@@ -160,12 +160,10 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             match &event {
                 RunEvent::Reopen {
-                    has_visible_windows,
+                    has_visible_windows: false,
                     ..
                 } => {
-                    if !has_visible_windows {
-                        focus_main_window(app_handle);
-                    }
+                    focus_main_window(app_handle);
                 }
                 RunEvent::MainEventsCleared => {
                     // SAFETY: the run callback is always invoked on the main thread
