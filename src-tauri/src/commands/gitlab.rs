@@ -388,9 +388,32 @@ fn find_latest_activity_from_others(
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReadStateSource {
+    User,
+    Auto,
+}
+
+impl ReadStateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReadStateSource::User => "user",
+            ReadStateSource::Auto => "auto",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "user" => ReadStateSource::User,
+            _ => ReadStateSource::Auto,
+        }
+    }
+}
+
 struct ReadStatus {
     unread: bool,
     latest_actor: Option<String>,
+    source: ReadStateSource,
 }
 
 fn resolve_unread_status(
@@ -404,43 +427,97 @@ fn resolve_unread_status(
     let read_store = app.store("mr_read_state.json").ok();
     let key = mr_id.to_string();
 
-    if let Some(ref store) = read_store {
-        if let Some(val) = store.get(&key) {
-            // stored as {unread: bool, updatedAt: string} or just bool (legacy)
-            if let Some(obj) = val.as_object() {
-                let stored_unread = obj
-                    .get("unread")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let stored_updated = obj
-                    .get("updatedAt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if stored_updated != updated_at {
-                    let latest_actor =
-                        find_latest_activity_from_others(notes, current_username, stored_updated);
-                    if latest_actor.is_some() {
-                        return ReadStatus { unread: true, latest_actor };
-                    }
-                    // no new activity from others — auto-read if approved by me
-                    if approved_by_me {
-                        return ReadStatus { unread: false, latest_actor: None };
-                    }
-                    return ReadStatus { unread: stored_unread, latest_actor: None };
+    let stored = read_store.as_ref().and_then(|s| s.get(&key));
+
+    if let Some(val) = stored {
+        if let Some(obj) = val.as_object() {
+            let stored_unread = obj
+                .get("unread")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let stored_updated = obj
+                .get("updatedAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let stored_source = obj
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(ReadStateSource::from_str)
+                .unwrap_or(ReadStateSource::Auto);
+
+            // user pinned the state and MR hasn't changed — respect it
+            if stored_source == ReadStateSource::User && stored_updated == updated_at {
+                return ReadStatus {
+                    unread: stored_unread,
+                    latest_actor: None,
+                    source: ReadStateSource::User,
+                };
+            }
+
+            // active approval from me — auto-read regardless of activity
+            if approved_by_me {
+                return ReadStatus {
+                    unread: false,
+                    latest_actor: None,
+                    source: ReadStateSource::Auto,
+                };
+            }
+
+            // MR changed since last fetch — check for activity from others
+            if stored_updated != updated_at {
+                let latest_actor =
+                    find_latest_activity_from_others(notes, current_username, stored_updated);
+                if latest_actor.is_some() {
+                    return ReadStatus {
+                        unread: true,
+                        latest_actor,
+                        source: ReadStateSource::Auto,
+                    };
                 }
-                return ReadStatus { unread: stored_unread, latest_actor: None };
+                return ReadStatus {
+                    unread: stored_unread,
+                    latest_actor: None,
+                    source: ReadStateSource::Auto,
+                };
             }
-            // legacy format: just a bool (false = read)
-            if let Some(unread_val) = val.as_bool() {
-                return ReadStatus { unread: unread_val, latest_actor: None };
+
+            // MR unchanged, no user pin, no approval — keep stored
+            return ReadStatus {
+                unread: stored_unread,
+                latest_actor: None,
+                source: ReadStateSource::Auto,
+            };
+        }
+        // legacy format: just a bool (false = read)
+        if let Some(unread_val) = val.as_bool() {
+            if approved_by_me {
+                return ReadStatus {
+                    unread: false,
+                    latest_actor: None,
+                    source: ReadStateSource::Auto,
+                };
             }
+            return ReadStatus {
+                unread: unread_val,
+                latest_actor: None,
+                source: ReadStateSource::Auto,
+            };
         }
     }
-    // new MR — auto-read if already approved by me
+
+    // new MR
     if approved_by_me {
-        return ReadStatus { unread: false, latest_actor: None };
+        return ReadStatus {
+            unread: false,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
     }
-    ReadStatus { unread: true, latest_actor: None }
+    ReadStatus {
+        unread: true,
+        latest_actor: None,
+        source: ReadStateSource::Auto,
+    }
 }
 
 fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
@@ -453,13 +530,20 @@ fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
     val.as_str().map(String::from)
 }
 
-fn persist_read_state(app: &AppHandle, mr_id: i64, unread: bool, updated_at: &str) {
+fn persist_read_state(
+    app: &AppHandle,
+    mr_id: i64,
+    unread: bool,
+    updated_at: &str,
+    source: ReadStateSource,
+) {
     if let Ok(store) = app.store("mr_read_state.json") {
         store.set(
             &mr_id.to_string(),
             serde_json::json!({
                 "unread": unread,
                 "updatedAt": updated_at,
+                "source": source.as_str(),
             }),
         );
         let _ = store.save();
@@ -579,7 +663,13 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
 
-        persist_read_state(&app, gl_mr.id, read_status.unread, &gl_mr.updated_at);
+        persist_read_state(
+            &app,
+            gl_mr.id,
+            read_status.unread,
+            &gl_mr.updated_at,
+            read_status.source,
+        );
 
         let mr = MergeRequest {
             id: gl_mr.id,
@@ -605,6 +695,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             reminder,
             activity,
             latest_actor: read_status.latest_actor,
+            updated_at_raw: gl_mr.updated_at.clone(),
         };
 
         active.push(mr);

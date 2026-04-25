@@ -86,22 +86,29 @@ fn check_and_fire_reminders(app: &AppHandle) {
                 Err(_) => continue,
             };
 
-            let title = {
+            let (title, updated_at_raw) = {
                 let prev = PREVIOUS_MRS.lock().ok();
-                prev.as_ref()
+                let mr = prev
+                    .as_ref()
                     .and_then(|opt| opt.as_ref())
-                    .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id))
-                    .map(|m| m.title.clone())
-                    .unwrap_or_else(|| format!("MR #{}", mr_id))
+                    .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id).cloned());
+                match mr {
+                    Some(m) => (m.title, m.updated_at_raw),
+                    None => (format!("MR #{}", mr_id), String::new()),
+                }
             };
 
             notifications::notify_reminder(app, &title);
 
-            // mark as unread
+            // mark as unread, pinned by user (reminder is treated as a user action)
             if let Ok(read_store) = app.store("mr_read_state.json") {
                 read_store.set(
                     &key,
-                    serde_json::json!({ "unread": true }),
+                    serde_json::json!({
+                        "unread": true,
+                        "updatedAt": updated_at_raw,
+                        "source": "user",
+                    }),
                 );
                 let _ = read_store.save();
             }

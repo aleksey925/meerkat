@@ -63,6 +63,9 @@ pub struct MergeRequest {
     pub activity: Vec<ActivityEvent>,
     #[serde(skip)]
     pub latest_actor: Option<String>,
+    // raw GitLab updated_at string, used as anchor for read-state comparisons
+    #[serde(skip)]
+    pub updated_at_raw: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

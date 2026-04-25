@@ -31,12 +31,14 @@ fn write_state(
     key: &str,
     unread: bool,
     updated_at: &str,
+    source: &str,
 ) {
     store.set(
         key,
         serde_json::json!({
             "unread": unread,
             "updatedAt": updated_at,
+            "source": source,
         }),
     );
 }
@@ -58,7 +60,7 @@ pub async fn toggle_unread(app: AppHandle, mr_id: i64) -> Result<bool, String> {
     let (current_unread, updated_at) = read_state(&store, &key);
 
     let new_value = !current_unread;
-    write_state(&store, &key, new_value, &updated_at);
+    write_state(&store, &key, new_value, &updated_at, "user");
     store.save().map_err(|e| format!("Save error: {e}"))?;
 
     Ok(new_value)
