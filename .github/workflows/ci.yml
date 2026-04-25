@@ -20,6 +20,9 @@ jobs:
       - name: Setup mise
         uses: jdx/mise-action@v2
 
+      - name: Sync rust toolchain
+        run: rustup install
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
