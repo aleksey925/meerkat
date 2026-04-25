@@ -416,39 +416,58 @@ struct ReadStatus {
     source: ReadStateSource,
 }
 
-fn resolve_unread_status(
-    app: &AppHandle,
-    mr_id: i64,
+#[derive(Debug, Clone, PartialEq)]
+enum StoredReadState {
+    Full {
+        unread: bool,
+        updated_at: String,
+        source: ReadStateSource,
+    },
+    LegacyBool(bool),
+}
+
+fn parse_stored_read_state(val: &serde_json::Value) -> Option<StoredReadState> {
+    if let Some(obj) = val.as_object() {
+        let unread = obj.get("unread").and_then(|v| v.as_bool()).unwrap_or(true);
+        let updated_at = obj
+            .get("updatedAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let source = obj
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(ReadStateSource::from_stored)
+            .unwrap_or(ReadStateSource::Auto);
+        return Some(StoredReadState::Full {
+            unread,
+            updated_at,
+            source,
+        });
+    }
+    if let Some(b) = val.as_bool() {
+        return Some(StoredReadState::LegacyBool(b));
+    }
+    None
+}
+
+fn decide_unread_status(
+    stored: Option<&StoredReadState>,
     updated_at: &str,
     notes: &[GitLabNote],
     current_username: &str,
     approved_by_me: bool,
 ) -> ReadStatus {
-    let read_store = app.store("mr_read_state.json").ok();
-    let key = mr_id.to_string();
-
-    let stored = read_store.as_ref().and_then(|s| s.get(&key));
-
-    if let Some(val) = stored {
-        if let Some(obj) = val.as_object() {
-            let stored_unread = obj
-                .get("unread")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let stored_updated = obj
-                .get("updatedAt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let stored_source = obj
-                .get("source")
-                .and_then(|v| v.as_str())
-                .map(ReadStateSource::from_stored)
-                .unwrap_or(ReadStateSource::Auto);
-
+    match stored {
+        Some(StoredReadState::Full {
+            unread: stored_unread,
+            updated_at: stored_updated,
+            source: stored_source,
+        }) => {
             // user pinned the state and MR hasn't changed — respect it
-            if stored_source == ReadStateSource::User && stored_updated == updated_at {
+            if *stored_source == ReadStateSource::User && stored_updated == updated_at {
                 return ReadStatus {
-                    unread: stored_unread,
+                    unread: *stored_unread,
                     latest_actor: None,
                     source: ReadStateSource::User,
                 };
@@ -475,49 +494,74 @@ fn resolve_unread_status(
                     };
                 }
                 return ReadStatus {
-                    unread: stored_unread,
+                    unread: *stored_unread,
                     latest_actor: None,
                     source: ReadStateSource::Auto,
                 };
             }
 
             // MR unchanged, no user pin, no approval — keep stored
-            return ReadStatus {
-                unread: stored_unread,
+            ReadStatus {
+                unread: *stored_unread,
                 latest_actor: None,
                 source: ReadStateSource::Auto,
-            };
+            }
         }
-        // legacy format: just a bool (false = read)
-        if let Some(unread_val) = val.as_bool() {
+        Some(StoredReadState::LegacyBool(b)) => {
             if approved_by_me {
-                return ReadStatus {
+                ReadStatus {
                     unread: false,
                     latest_actor: None,
                     source: ReadStateSource::Auto,
-                };
+                }
+            } else {
+                ReadStatus {
+                    unread: *b,
+                    latest_actor: None,
+                    source: ReadStateSource::Auto,
+                }
             }
-            return ReadStatus {
-                unread: unread_val,
-                latest_actor: None,
-                source: ReadStateSource::Auto,
-            };
+        }
+        None => {
+            if approved_by_me {
+                ReadStatus {
+                    unread: false,
+                    latest_actor: None,
+                    source: ReadStateSource::Auto,
+                }
+            } else {
+                ReadStatus {
+                    unread: true,
+                    latest_actor: None,
+                    source: ReadStateSource::Auto,
+                }
+            }
         }
     }
+}
 
-    // new MR
-    if approved_by_me {
-        return ReadStatus {
-            unread: false,
-            latest_actor: None,
-            source: ReadStateSource::Auto,
-        };
-    }
-    ReadStatus {
-        unread: true,
-        latest_actor: None,
-        source: ReadStateSource::Auto,
-    }
+fn resolve_unread_status(
+    app: &AppHandle,
+    mr_id: i64,
+    updated_at: &str,
+    notes: &[GitLabNote],
+    current_username: &str,
+    approved_by_me: bool,
+) -> ReadStatus {
+    let read_store = app.store("mr_read_state.json").ok();
+    let key = mr_id.to_string();
+    let stored = read_store
+        .as_ref()
+        .and_then(|s| s.get(&key))
+        .as_ref()
+        .and_then(parse_stored_read_state);
+    decide_unread_status(
+        stored.as_ref(),
+        updated_at,
+        notes,
+        current_username,
+        approved_by_me,
+    )
 }
 
 fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
@@ -708,4 +752,295 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         active,
         projects,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ME: &str = "me";
+    const T1: &str = "2026-01-01T10:00:00Z";
+    const T2: &str = "2026-01-02T10:00:00Z";
+    const T3: &str = "2026-01-03T10:00:00Z";
+
+    fn note(username: &str, created_at: &str) -> GitLabNote {
+        GitLabNote {
+            id: 1,
+            body: String::new(),
+            author: GitLabUser {
+                id: 1,
+                username: username.to_string(),
+                name: format!("Name {username}"),
+                avatar_url: String::new(),
+            },
+            created_at: created_at.to_string(),
+            system: None,
+            noteable_type: None,
+        }
+    }
+
+    fn full(unread: bool, updated_at: &str, source: ReadStateSource) -> StoredReadState {
+        StoredReadState::Full {
+            unread,
+            updated_at: updated_at.to_string(),
+            source,
+        }
+    }
+
+    fn decide(
+        stored: Option<&StoredReadState>,
+        updated_at: &str,
+        notes: &[GitLabNote],
+        approved_by_me: bool,
+    ) -> ReadStatus {
+        decide_unread_status(stored, updated_at, notes, ME, approved_by_me)
+    }
+
+    // --- find_latest_activity_from_others ---
+
+    #[test]
+    fn find_latest_activity_from_others_empty_notes_returns_none() {
+        assert!(find_latest_activity_from_others(&[], ME, T1).is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_only_my_notes_returns_none() {
+        let notes = vec![note(ME, T3), note(ME, T2)];
+        assert!(find_latest_activity_from_others(&notes, ME, T1).is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_returns_other_skipping_my_newer_note() {
+        // notes are sorted desc (newest first), as GitLab returns them
+        let other = note("alice", T2);
+        let notes = vec![note(ME, T3), other.clone()];
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+        assert_eq!(actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_skips_notes_at_or_before_since() {
+        let notes = vec![note("alice", T1)];
+        assert!(find_latest_activity_from_others(&notes, ME, T1).is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_picks_most_recent_when_multiple_others() {
+        // first note in desc-sorted list is the newest — function should return that one
+        let newest_other = note("alice", T3);
+        let older_other = note("bob", T2);
+        let notes = vec![newest_other.clone(), older_other];
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+        assert_eq!(actor, Some(newest_other.author.name));
+    }
+
+    // --- parse_stored_read_state ---
+
+    #[test]
+    fn parse_full_object_extracts_all_fields() {
+        let val = serde_json::json!({
+            "unread": false,
+            "updatedAt": T1,
+            "source": "user",
+        });
+        assert_eq!(
+            parse_stored_read_state(&val),
+            Some(full(false, T1, ReadStateSource::User))
+        );
+    }
+
+    #[test]
+    fn parse_object_missing_source_defaults_to_auto() {
+        let val = serde_json::json!({ "unread": true, "updatedAt": T1 });
+        assert_eq!(
+            parse_stored_read_state(&val),
+            Some(full(true, T1, ReadStateSource::Auto))
+        );
+    }
+
+    #[test]
+    fn parse_object_unknown_source_defaults_to_auto() {
+        let val = serde_json::json!({ "unread": true, "updatedAt": T1, "source": "weird" });
+        assert_eq!(
+            parse_stored_read_state(&val),
+            Some(full(true, T1, ReadStateSource::Auto))
+        );
+    }
+
+    #[test]
+    fn parse_object_missing_updated_at_defaults_to_empty() {
+        let val = serde_json::json!({ "unread": true });
+        assert_eq!(
+            parse_stored_read_state(&val),
+            Some(full(true, "", ReadStateSource::Auto))
+        );
+    }
+
+    #[test]
+    fn parse_legacy_bool_returns_legacy_variant() {
+        assert_eq!(
+            parse_stored_read_state(&serde_json::Value::Bool(false)),
+            Some(StoredReadState::LegacyBool(false))
+        );
+        assert_eq!(
+            parse_stored_read_state(&serde_json::Value::Bool(true)),
+            Some(StoredReadState::LegacyBool(true))
+        );
+    }
+
+    #[test]
+    fn parse_unknown_value_returns_none() {
+        assert_eq!(parse_stored_read_state(&serde_json::Value::Null), None);
+        assert_eq!(parse_stored_read_state(&serde_json::json!("string")), None);
+        assert_eq!(parse_stored_read_state(&serde_json::json!(42)), None);
+    }
+
+    // --- decide_unread_status: new MR ---
+
+    #[test]
+    fn new_mr_not_approved_is_unread_auto() {
+        let r = decide(None, T1, &[], false);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn new_mr_approved_is_read_auto() {
+        let r = decide(None, T1, &[], true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: user pin ---
+
+    #[test]
+    fn user_pin_unchanged_mr_respected_even_when_approved() {
+        let stored = full(true, T1, ReadStateSource::User);
+        let r = decide(Some(&stored), T1, &[note("alice", T2)], true);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn user_pin_to_read_unchanged_mr_respected() {
+        let stored = full(false, T1, ReadStateSource::User);
+        let r = decide(Some(&stored), T1, &[note("alice", T2)], false);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn user_pin_invalidated_then_approval_marks_read() {
+        // pin valid for T1, but MR is now at T2 — pin protected only while updatedAt matches
+        let stored = full(true, T1, ReadStateSource::User);
+        let r = decide(Some(&stored), T2, &[], true);
+        // approval kicks in next, marks read
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_invalidated_then_others_activity_marks_unread() {
+        let stored = full(false, T1, ReadStateSource::User);
+        let other = note("alice", T2);
+        let r = decide(Some(&stored), T2, std::slice::from_ref(&other), false);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn user_pin_invalidated_with_only_my_activity_keeps_stored_unread() {
+        let stored = full(false, T1, ReadStateSource::User);
+        let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: approval auto-mark ---
+
+    #[test]
+    fn auto_state_unchanged_mr_with_approval_marks_read() {
+        let stored = full(true, T1, ReadStateSource::Auto);
+        let r = decide(Some(&stored), T1, &[], true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_approval_marks_read_ignoring_others_activity() {
+        // active approval beats activity-from-others rule (matches user's spec)
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let r = decide(Some(&stored), T2, &[note("alice", T2)], true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    // --- decide_unread_status: activity from others ---
+
+    #[test]
+    fn auto_state_changed_mr_with_others_activity_marks_unread() {
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let other = note("alice", T2);
+        let r = decide(Some(&stored), T2, std::slice::from_ref(&other), false);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_only_my_activity_keeps_stored_unread() {
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    // --- decide_unread_status: unchanged MR without pin/approval ---
+
+    #[test]
+    fn auto_state_unchanged_mr_no_approval_keeps_stored_unread() {
+        let stored = full(true, T1, ReadStateSource::Auto);
+        let r = decide(Some(&stored), T1, &[note("alice", T2)], false);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: legacy bool ---
+
+    #[test]
+    fn legacy_bool_unread_true_not_approved_stays_unread() {
+        let stored = StoredReadState::LegacyBool(true);
+        let r = decide(Some(&stored), T1, &[], false);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn legacy_bool_unread_false_not_approved_stays_read() {
+        let stored = StoredReadState::LegacyBool(false);
+        let r = decide(Some(&stored), T1, &[], false);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn legacy_bool_with_approval_marks_read() {
+        let stored = StoredReadState::LegacyBool(true);
+        let r = decide(Some(&stored), T1, &[], true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- ReadStateSource round-trip ---
+
+    #[test]
+    fn read_state_source_roundtrip() {
+        for src in [ReadStateSource::User, ReadStateSource::Auto] {
+            assert_eq!(ReadStateSource::from_stored(src.as_str()), src);
+        }
+    }
 }

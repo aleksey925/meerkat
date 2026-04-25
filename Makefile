@@ -11,3 +11,6 @@ dev:
 
 build:
 	npm run tauri build -- $(TAURI_VERSION_CONFIG)
+
+test:
+	cargo test --manifest-path src-tauri/Cargo.toml --lib
