@@ -402,7 +402,7 @@ impl ReadStateSource {
         }
     }
 
-    fn from_str(s: &str) -> Self {
+    fn from_stored(s: &str) -> Self {
         match s {
             "user" => ReadStateSource::User,
             _ => ReadStateSource::Auto,
@@ -442,7 +442,7 @@ fn resolve_unread_status(
             let stored_source = obj
                 .get("source")
                 .and_then(|v| v.as_str())
-                .map(ReadStateSource::from_str)
+                .map(ReadStateSource::from_stored)
                 .unwrap_or(ReadStateSource::Auto);
 
             // user pinned the state and MR hasn't changed — respect it

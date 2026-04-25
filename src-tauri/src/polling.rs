@@ -13,6 +13,12 @@ static POLLING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CHECK_CYCLE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_MRS: Mutex<Option<Vec<MergeRequest>>> = Mutex::new(None);
 
+pub(crate) fn previous_mr_updated_at_raw(mr_id: i64) -> Option<String> {
+    let prev = PREVIOUS_MRS.lock().ok()?;
+    let mrs = prev.as_ref()?;
+    mrs.iter().find(|m| m.id == mr_id).map(|m| m.updated_at_raw.clone())
+}
+
 fn detect_changes_and_notify(
     app: &AppHandle,
     new_active: &[MergeRequest],
@@ -86,7 +92,7 @@ fn check_and_fire_reminders(app: &AppHandle) {
                 Err(_) => continue,
             };
 
-            let (title, updated_at_raw) = {
+            let (title, prev_updated_at) = {
                 let prev = PREVIOUS_MRS.lock().ok();
                 let mr = prev
                     .as_ref()
@@ -100,16 +106,23 @@ fn check_and_fire_reminders(app: &AppHandle) {
 
             notifications::notify_reminder(app, &title);
 
-            // mark as unread, pinned by user (reminder is treated as a user action)
+            // mark as unread, pinned by user (reminder is treated as a user action).
+            // if PREVIOUS_MRS doesn't have the MR (e.g. first cycle of a fresh session),
+            // preserve the updatedAt that's already in the store so the pin survives the
+            // upcoming fetch.
             if let Ok(read_store) = app.store("mr_read_state.json") {
-                read_store.set(
-                    &key,
-                    serde_json::json!({
-                        "unread": true,
-                        "updatedAt": updated_at_raw,
-                        "source": "user",
-                    }),
-                );
+                let updated_at = if !prev_updated_at.is_empty() {
+                    prev_updated_at
+                } else {
+                    read_store
+                        .get(&key)
+                        .and_then(|v| {
+                            v.as_object()
+                                .and_then(|o| o.get("updatedAt").and_then(|u| u.as_str()).map(String::from))
+                        })
+                        .unwrap_or_default()
+                };
+                crate::commands::system::write_state(&read_store, &key, true, &updated_at, "user");
                 let _ = read_store.save();
             }
 

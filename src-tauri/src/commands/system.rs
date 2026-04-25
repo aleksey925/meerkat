@@ -26,7 +26,7 @@ fn read_state(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str) -> (bool
         .unwrap_or((true, String::new()))
 }
 
-fn write_state(
+pub(crate) fn write_state(
     store: &tauri_plugin_store::Store<tauri::Wry>,
     key: &str,
     unread: bool,
@@ -57,7 +57,13 @@ pub async fn toggle_unread(app: AppHandle, mr_id: i64) -> Result<bool, String> {
         .map_err(|e| format!("Store error: {e}"))?;
 
     let key = mr_id.to_string();
-    let (current_unread, updated_at) = read_state(&store, &key);
+    let (current_unread, mut updated_at) = read_state(&store, &key);
+
+    // legacy bool entries have no updatedAt — fall back to the latest known value
+    // so the user-pin can be respected on the next fetch
+    if updated_at.is_empty() {
+        updated_at = crate::polling::previous_mr_updated_at_raw(mr_id).unwrap_or_default();
+    }
 
     let new_value = !current_unread;
     write_state(&store, &key, new_value, &updated_at, "user");
