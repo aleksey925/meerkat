@@ -265,6 +265,40 @@ async fn fetch_approvals(
     }
 }
 
+async fn fetch_reviewer_states(
+    client: &Client,
+    base_url: &str,
+    project_id: i64,
+    mr_iid: i64,
+) -> Vec<GitLabReviewerState> {
+    let url = format!(
+        "{}/api/v4/projects/{}/merge_requests/{}",
+        base_url, project_id, mr_iid
+    );
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+
+    let detail: GitLabMrDetail = match resp.json().await {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    detail.reviewers.unwrap_or_default()
+}
+
+fn me_requested_changes(reviewers: &[GitLabReviewerState], current_uid: i64) -> bool {
+    reviewers
+        .iter()
+        .any(|r| r.id == current_uid && r.state.as_deref() == Some("requested_changes"))
+}
+
 async fn fetch_notes(
     client: &Client,
     base_url: &str,
@@ -467,86 +501,71 @@ fn decide_unread_status(
     notes: &[GitLabNote],
     current_username: &str,
     approved_by_me: bool,
+    i_requested_changes: bool,
 ) -> ReadStatus {
-    match stored {
+    let (stored_unread, stored_updated, stored_source) = match stored {
         Some(StoredReadState::Full {
-            unread: stored_unread,
-            updated_at: stored_updated,
-            source: stored_source,
-        }) => {
-            // user pinned the state and MR hasn't changed — respect it
-            if *stored_source == ReadStateSource::User && stored_updated == updated_at {
-                return ReadStatus {
-                    unread: *stored_unread,
-                    latest_actor: None,
-                    source: ReadStateSource::User,
-                };
-            }
+            unread,
+            updated_at,
+            source,
+        }) => (Some(*unread), Some(updated_at.as_str()), Some(*source)),
+        Some(StoredReadState::LegacyBool(b)) => (Some(*b), None, None),
+        None => (None, None, None),
+    };
 
-            // active approval from me — auto-read regardless of activity
-            if approved_by_me {
-                return ReadStatus {
-                    unread: false,
-                    latest_actor: None,
-                    source: ReadStateSource::Auto,
-                };
-            }
-
-            // MR changed since last fetch — check for activity from others
-            if stored_updated != updated_at {
-                let latest_actor =
-                    find_latest_activity_from_others(notes, current_username, stored_updated);
-                if latest_actor.is_some() {
-                    return ReadStatus {
-                        unread: true,
-                        latest_actor,
-                        source: ReadStateSource::Auto,
-                    };
-                }
-                return ReadStatus {
-                    unread: *stored_unread,
-                    latest_actor: None,
-                    source: ReadStateSource::Auto,
-                };
-            }
-
-            // MR unchanged, no user pin, no approval — keep stored
-            ReadStatus {
-                unread: *stored_unread,
+    // 1. user pinned the state and MR hasn't changed — respect it
+    if let (Some(unread), Some(stored_ts), Some(ReadStateSource::User)) =
+        (stored_unread, stored_updated, stored_source)
+    {
+        if stored_ts == updated_at {
+            return ReadStatus {
+                unread,
                 latest_actor: None,
-                source: ReadStateSource::Auto,
-            }
+                source: ReadStateSource::User,
+            };
         }
-        Some(StoredReadState::LegacyBool(b)) => {
-            if approved_by_me {
-                ReadStatus {
-                    unread: false,
-                    latest_actor: None,
-                    source: ReadStateSource::Auto,
-                }
-            } else {
-                ReadStatus {
-                    unread: *b,
-                    latest_actor: None,
-                    source: ReadStateSource::Auto,
-                }
-            }
-        }
-        None => {
-            if approved_by_me {
-                ReadStatus {
-                    unread: false,
-                    latest_actor: None,
-                    source: ReadStateSource::Auto,
-                }
-            } else {
-                ReadStatus {
+    }
+
+    // 2. active approval from me — auto-read (GitLab resets approval on push,
+    // so the next "real" activity will fall through to step 3 naturally)
+    if approved_by_me {
+        return ReadStatus {
+            unread: false,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
+    }
+
+    // 3. MR changed since last fetch and someone else acted — auto-unread
+    if let Some(stored_ts) = stored_updated {
+        if stored_ts != updated_at {
+            let latest_actor = find_latest_activity_from_others(notes, current_username, stored_ts);
+            if latest_actor.is_some() {
+                return ReadStatus {
                     unread: true,
-                    latest_actor: None,
+                    latest_actor,
                     source: ReadStateSource::Auto,
-                }
+                };
             }
         }
+    }
+
+    // 4. I left a "request changes" review — auto-read. Sits below activity-from-others
+    // so any reaction from the author (push, comment) flips it back to unread for the
+    // next round of the fix cycle.
+    if i_requested_changes {
+        return ReadStatus {
+            unread: false,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
+    }
+
+    // 5. fallback — keep stored, default to unread for new MRs
+    ReadStatus {
+        unread: stored_unread.unwrap_or(true),
+        latest_actor: None,
+        source: ReadStateSource::Auto,
     }
 }
 
@@ -557,6 +576,7 @@ fn resolve_unread_status(
     notes: &[GitLabNote],
     current_username: &str,
     approved_by_me: bool,
+    i_requested_changes: bool,
 ) -> ReadStatus {
     let read_store = app.store("mr_read_state.json").ok();
     let key = mr_id.to_string();
@@ -571,6 +591,7 @@ fn resolve_unread_status(
         notes,
         current_username,
         approved_by_me,
+        i_requested_changes,
     )
 }
 
@@ -697,6 +718,9 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         let approval_info =
             fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
         let pipeline = fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let reviewer_states =
+            fetch_reviewer_states(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let requested_changes = me_requested_changes(&reviewer_states, uid);
         let role = determine_role(gl_mr, uid, &username, &notes);
         let status = determine_status(gl_mr, approval_info.current, approval_info.required);
         let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
@@ -714,6 +738,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             &notes,
             &username,
             approval_info.approved_by_me,
+            requested_changes,
         );
         let reminder = resolve_reminder(&app, gl_mr.id);
 
@@ -804,7 +829,31 @@ mod tests {
         notes: &[GitLabNote],
         approved_by_me: bool,
     ) -> ReadStatus {
-        decide_unread_status(stored, updated_at, notes, ME, approved_by_me)
+        decide_unread_status(stored, updated_at, notes, ME, approved_by_me, false)
+    }
+
+    fn decide_with_rc(
+        stored: Option<&StoredReadState>,
+        updated_at: &str,
+        notes: &[GitLabNote],
+        approved_by_me: bool,
+        i_requested_changes: bool,
+    ) -> ReadStatus {
+        decide_unread_status(
+            stored,
+            updated_at,
+            notes,
+            ME,
+            approved_by_me,
+            i_requested_changes,
+        )
+    }
+
+    fn reviewer(uid: i64, state: Option<&str>) -> GitLabReviewerState {
+        GitLabReviewerState {
+            id: uid,
+            state: state.map(String::from),
+        }
     }
 
     // --- find_latest_activity_from_others ---
@@ -1044,6 +1093,101 @@ mod tests {
         let r = decide(Some(&stored), T1, &[], true);
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: requested_changes by me ---
+
+    #[test]
+    fn new_mr_with_my_requested_changes_is_read_auto() {
+        let r = decide_with_rc(None, T1, &[], false, true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn auto_state_unchanged_mr_with_my_requested_changes_marks_read() {
+        let stored = full(true, T1, ReadStateSource::Auto);
+        let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_my_requested_changes_and_others_activity_marks_unread() {
+        // key fix-cycle case: I asked for changes, author pushed/replied — back to unread
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let other = note("alice", T2);
+        let r = decide_with_rc(Some(&stored), T2, std::slice::from_ref(&other), false, true);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_my_requested_changes_and_only_my_activity_marks_read() {
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let r = decide_with_rc(Some(&stored), T2, &[note(ME, T2)], false, true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn approval_takes_precedence_over_requested_changes() {
+        let r = decide_with_rc(None, T1, &[], true, true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_unchanged_mr_with_my_requested_changes_respects_pin() {
+        let stored = full(true, T1, ReadStateSource::User);
+        let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn legacy_bool_with_my_requested_changes_marks_read() {
+        let stored = StoredReadState::LegacyBool(true);
+        let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- me_requested_changes helper ---
+
+    #[test]
+    fn me_requested_changes_returns_true_when_my_state_is_requested_changes() {
+        let reviewers = vec![
+            reviewer(2, Some("approved")),
+            reviewer(1, Some("requested_changes")),
+        ];
+        assert!(me_requested_changes(&reviewers, 1));
+    }
+
+    #[test]
+    fn me_requested_changes_returns_false_for_other_states() {
+        for state in ["unreviewed", "reviewed", "approved"] {
+            let reviewers = vec![reviewer(1, Some(state))];
+            assert!(!me_requested_changes(&reviewers, 1));
+        }
+    }
+
+    #[test]
+    fn me_requested_changes_returns_false_when_state_missing() {
+        let reviewers = vec![reviewer(1, None)];
+        assert!(!me_requested_changes(&reviewers, 1));
+    }
+
+    #[test]
+    fn me_requested_changes_ignores_other_reviewers_state() {
+        let reviewers = vec![reviewer(2, Some("requested_changes"))];
+        assert!(!me_requested_changes(&reviewers, 1));
+    }
+
+    #[test]
+    fn me_requested_changes_returns_false_for_empty_reviewers() {
+        assert!(!me_requested_changes(&[], 1));
     }
 
     // --- ReadStateSource round-trip ---

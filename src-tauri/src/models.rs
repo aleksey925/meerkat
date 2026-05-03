@@ -144,6 +144,17 @@ pub struct GitLabPipeline {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct GitLabReviewerState {
+    pub id: i64,
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabMrDetail {
+    pub reviewers: Option<Vec<GitLabReviewerState>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct GitLabApprovals {
     pub approved: Option<bool>,
     pub approvals_left: Option<i32>,
