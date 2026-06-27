@@ -412,7 +412,7 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
         color: "#5e5ce6".to_string(),
     });
 
-    for note in notes.iter().rev().take(20) {
+    for note in notes.iter().take(20).rev() {
         let is_system = note.system.unwrap_or(false);
         events.push(ActivityEvent {
             who: if is_system {
