@@ -737,7 +737,7 @@ fn resolve_unread_status(
     current_username: &str,
     signals: ReadSignals,
 ) -> ReadStatus {
-    let read_store = app.store("mr_read_state.json").ok();
+    let read_store = app.store(crate::commands::system::READ_STATE_STORE).ok();
     let key = mr_id.to_string();
     let stored = read_store
         .as_ref()
@@ -771,7 +771,7 @@ fn persist_read_state(
     source: ReadStateSource,
     review_request_todo_id: Option<i64>,
 ) {
-    if let Ok(store) = app.store("mr_read_state.json") {
+    if let Ok(store) = app.store(crate::commands::system::READ_STATE_STORE) {
         store.set(
             mr_id.to_string(),
             serde_json::json!({
@@ -1072,6 +1072,31 @@ mod tests {
         )
     }
 
+    fn gl_mr() -> GitLabMr {
+        GitLabMr {
+            id: 1,
+            iid: 1,
+            title: "Title".to_string(),
+            source_branch: "src".to_string(),
+            target_branch: "main".to_string(),
+            author: GitLabUser {
+                id: 99,
+                username: "author".to_string(),
+                name: "Author Name".to_string(),
+                avatar_url: String::new(),
+            },
+            reviewers: None,
+            assignees: None,
+            state: "opened".to_string(),
+            draft: None,
+            work_in_progress: None,
+            has_conflicts: None,
+            web_url: String::new(),
+            updated_at: T3.to_string(),
+            project_id: 1,
+        }
+    }
+
     fn reviewer(uid: i64, state: Option<&str>) -> GitLabReviewerState {
         GitLabReviewerState {
             user: GitLabUser {
@@ -1088,36 +1113,61 @@ mod tests {
 
     #[test]
     fn find_latest_activity_from_others_empty_notes_returns_none() {
-        assert!(find_latest_activity_from_others(&[], ME, T1).is_none());
+        // act
+        let actor = find_latest_activity_from_others(&[], ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     #[test]
     fn find_latest_activity_from_others_only_my_notes_returns_none() {
+        // arrange
         let notes = vec![note(ME, T3), note(ME, T2)];
-        assert!(find_latest_activity_from_others(&notes, ME, T1).is_none());
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     #[test]
     fn find_latest_activity_from_others_returns_none_when_my_note_is_newest() {
-        // my own comment is the latest activity: nothing to attribute to others,
-        // otherwise my comment would notify me naming whoever spoke before me
+        // arrange — my own comment is the latest activity: nothing to attribute to
+        // others, otherwise my comment would notify me naming whoever spoke before me
         let notes = vec![note(ME, T3), note("alice", T2)];
-        assert!(find_latest_activity_from_others(&notes, ME, T1).is_none());
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     #[test]
     fn find_latest_activity_from_others_skips_notes_at_or_before_since() {
+        // arrange
         let notes = vec![note("alice", T1)];
-        assert!(find_latest_activity_from_others(&notes, ME, T1).is_none());
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     #[test]
     fn find_latest_activity_from_others_picks_most_recent_when_multiple_others() {
-        // first note in desc-sorted list is the newest — function should return that one
+        // arrange — first note in desc-sorted list is the newest
         let newest_other = note("alice", T3);
         let older_other = note("bob", T2);
         let notes = vec![newest_other.clone(), older_other];
+
+        // act
         let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
         assert_eq!(actor, Some(newest_other.author.name));
     }
 
@@ -1125,109 +1175,153 @@ mod tests {
 
     #[test]
     fn find_latest_comment_returns_human_comment_from_others() {
+        // arrange
         let other = note("alice", T2);
+
+        // act
         let actor = find_latest_comment_from_others(std::slice::from_ref(&other), ME, T1);
+
+        // assert
         assert_eq!(actor, Some(other.author.name));
     }
 
     #[test]
     fn find_latest_comment_skips_others_system_note_for_older_comment() {
-        // a push (system) on top of a real comment still surfaces the comment
+        // arrange — a push (system) on top of a real comment still surfaces the comment
         let comment = note("alice", T2);
         let notes = vec![system_note("alice", T3), comment.clone()];
+
+        // act
         let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
         assert_eq!(actor, Some(comment.author.name));
     }
 
     #[test]
     fn find_latest_comment_returns_none_when_only_others_system_notes() {
+        // arrange
         let notes = vec![system_note("alice", T3)];
-        assert!(find_latest_comment_from_others(&notes, ME, T1).is_none());
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     #[test]
     fn find_latest_comment_returns_none_when_my_action_is_newest() {
-        // my approval (system, mine) on top of others' comment — I'm up to date
+        // arrange — my approval (system, mine) on top of others' comment — I'm up to date
         let notes = vec![system_note(ME, T3), note("alice", T2)];
-        assert!(find_latest_comment_from_others(&notes, ME, T1).is_none());
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     #[test]
     fn find_latest_comment_returns_none_at_or_before_since() {
+        // arrange
         let notes = vec![note("alice", T1)];
-        assert!(find_latest_comment_from_others(&notes, ME, T1).is_none());
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
     }
 
     // --- parse_stored_read_state ---
 
     #[test]
     fn parse_full_object_extracts_all_fields() {
+        // arrange
         let val = serde_json::json!({
             "unread": false,
             "updatedAt": T1,
             "source": "user",
         });
-        assert_eq!(
-            parse_stored_read_state(&val),
-            Some(full(false, T1, ReadStateSource::User))
-        );
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(false, T1, ReadStateSource::User)));
     }
 
     #[test]
     fn parse_full_object_extracts_review_request_todo_id() {
+        // arrange
         let val = serde_json::json!({
             "unread": false,
             "updatedAt": T1,
             "source": "user",
             "reviewRequestTodoId": 42,
         });
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
         assert_eq!(
-            parse_stored_read_state(&val),
+            parsed,
             Some(full_todo(false, T1, ReadStateSource::User, Some(42)))
         );
     }
 
     #[test]
     fn parse_object_missing_source_defaults_to_auto() {
+        // arrange
         let val = serde_json::json!({ "unread": true, "updatedAt": T1 });
-        assert_eq!(
-            parse_stored_read_state(&val),
-            Some(full(true, T1, ReadStateSource::Auto))
-        );
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(true, T1, ReadStateSource::Auto)));
     }
 
     #[test]
     fn parse_object_unknown_source_defaults_to_auto() {
+        // arrange
         let val = serde_json::json!({ "unread": true, "updatedAt": T1, "source": "weird" });
-        assert_eq!(
-            parse_stored_read_state(&val),
-            Some(full(true, T1, ReadStateSource::Auto))
-        );
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(true, T1, ReadStateSource::Auto)));
     }
 
     #[test]
     fn parse_object_missing_updated_at_defaults_to_empty() {
+        // arrange
         let val = serde_json::json!({ "unread": true });
-        assert_eq!(
-            parse_stored_read_state(&val),
-            Some(full(true, "", ReadStateSource::Auto))
-        );
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(true, "", ReadStateSource::Auto)));
     }
 
     #[test]
     fn parse_legacy_bool_returns_legacy_variant() {
-        assert_eq!(
-            parse_stored_read_state(&serde_json::Value::Bool(false)),
-            Some(StoredReadState::LegacyBool(false))
-        );
-        assert_eq!(
-            parse_stored_read_state(&serde_json::Value::Bool(true)),
-            Some(StoredReadState::LegacyBool(true))
-        );
+        // act
+        let parsed_false = parse_stored_read_state(&serde_json::Value::Bool(false));
+        let parsed_true = parse_stored_read_state(&serde_json::Value::Bool(true));
+
+        // assert
+        assert_eq!(parsed_false, Some(StoredReadState::LegacyBool(false)));
+        assert_eq!(parsed_true, Some(StoredReadState::LegacyBool(true)));
     }
 
     #[test]
     fn parse_unknown_value_returns_none() {
+        // act / assert
         assert_eq!(parse_stored_read_state(&serde_json::Value::Null), None);
         assert_eq!(parse_stored_read_state(&serde_json::json!("string")), None);
         assert_eq!(parse_stored_read_state(&serde_json::json!(42)), None);
@@ -1237,7 +1331,10 @@ mod tests {
 
     #[test]
     fn new_mr_not_approved_is_unread_auto() {
+        // act
         let r = decide(None, T1, &[], false);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert!(r.latest_actor.is_none());
@@ -1245,7 +1342,10 @@ mod tests {
 
     #[test]
     fn new_mr_approved_is_read_auto() {
+        // act
         let r = decide(None, T1, &[], true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1254,35 +1354,53 @@ mod tests {
 
     #[test]
     fn user_pin_unchanged_mr_respected_even_when_approved() {
+        // arrange
         let stored = full(true, T1, ReadStateSource::User);
+
+        // act
         let r = decide(Some(&stored), T1, &[note("alice", T2)], true);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::User);
     }
 
     #[test]
     fn user_pin_to_read_unchanged_mr_respected() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::User);
+
+        // act
         let r = decide(Some(&stored), T1, &[note("alice", T2)], false);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::User);
     }
 
     #[test]
     fn user_pin_invalidated_then_approval_marks_read() {
-        // pin valid for T1, but MR is now at T2 — pin protected only while updatedAt matches
+        // arrange — pin valid for T1, but MR is now at T2; pin holds only while updatedAt matches
         let stored = full(true, T1, ReadStateSource::User);
+
+        // act
         let r = decide(Some(&stored), T2, &[], true);
-        // approval kicks in next, marks read
+
+        // assert — approval kicks in next, marks read
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn user_pin_invalidated_then_others_activity_marks_unread() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::User);
         let other = note("alice", T2);
+
+        // act
         let r = decide(Some(&stored), T2, std::slice::from_ref(&other), false);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert_eq!(r.latest_actor, Some(other.author.name));
@@ -1290,8 +1408,13 @@ mod tests {
 
     #[test]
     fn user_pin_invalidated_with_only_my_activity_keeps_stored_unread() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::User);
+
+        // act
         let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1300,18 +1423,27 @@ mod tests {
 
     #[test]
     fn auto_state_unchanged_mr_with_approval_marks_read() {
+        // arrange
         let stored = full(true, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide(Some(&stored), T1, &[], true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn approval_keeps_read_when_only_system_notes_follow() {
-        // approval silences CI/push noise: a system note from another must not
-        // resurface the MR
+        // arrange — approval silences CI/push noise: a system note from another
+        // must not resurface the MR
         let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide(Some(&stored), T2, &[system_note("alice", T2)], true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert!(r.latest_actor.is_none());
@@ -1319,10 +1451,14 @@ mod tests {
 
     #[test]
     fn approval_does_not_silence_human_comment_from_others() {
-        // a real comment must reach me even after I approved (matches user's spec)
+        // arrange — a real comment must reach me even after I approved (matches user's spec)
         let stored = full(false, T1, ReadStateSource::Auto);
         let other = note("alice", T2);
+
+        // act
         let r = decide(Some(&stored), T2, std::slice::from_ref(&other), true);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert_eq!(r.latest_actor, Some(other.author.name));
@@ -1330,20 +1466,28 @@ mod tests {
 
     #[test]
     fn approval_then_my_own_comment_stays_read() {
-        // approving and then commenting myself: I'm up to date, no resurface
+        // arrange — approving and then commenting myself: I'm up to date, no resurface
         let stored = full(false, T1, ReadStateSource::Auto);
         let notes = [note(ME, T3), system_note(ME, T2)];
+
+        // act
         let r = decide(Some(&stored), T3, &notes, true);
+
+        // assert
         assert!(!r.unread);
         assert!(r.latest_actor.is_none());
     }
 
     #[test]
     fn approval_with_others_comment_before_my_action_stays_read() {
-        // others commented, then I approved on top — I've seen it, stay read
+        // arrange — others commented, then I approved on top; I've seen it, stay read
         let stored = full(false, T1, ReadStateSource::Auto);
         let notes = [system_note(ME, T3), note("alice", T2)];
+
+        // act
         let r = decide(Some(&stored), T3, &notes, true);
+
+        // assert
         assert!(!r.unread);
         assert!(r.latest_actor.is_none());
     }
@@ -1352,9 +1496,14 @@ mod tests {
 
     #[test]
     fn auto_state_changed_mr_with_others_activity_marks_unread() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
         let other = note("alice", T2);
+
+        // act
         let r = decide(Some(&stored), T2, std::slice::from_ref(&other), false);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert_eq!(r.latest_actor, Some(other.author.name));
@@ -1362,8 +1511,13 @@ mod tests {
 
     #[test]
     fn auto_state_changed_mr_with_only_my_activity_keeps_stored_unread() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert!(r.latest_actor.is_none());
@@ -1371,10 +1525,14 @@ mod tests {
 
     #[test]
     fn my_comment_after_others_note_does_not_set_actor() {
-        // user pinned unread, then commented themselves: must stay unread but
-        // expose no actor, so polling won't fire a notification for my own comment
+        // arrange — user pinned unread, then commented themselves: must stay unread
+        // but expose no actor, so polling won't fire a notification for my own comment
         let stored = full(true, T1, ReadStateSource::User);
+
+        // act
         let r = decide(Some(&stored), T3, &[note(ME, T3), note("alice", T2)], false);
+
+        // assert
         assert!(r.unread);
         assert!(r.latest_actor.is_none());
     }
@@ -1383,8 +1541,13 @@ mod tests {
 
     #[test]
     fn auto_state_unchanged_mr_no_approval_keeps_stored_unread() {
+        // arrange
         let stored = full(true, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide(Some(&stored), T1, &[note("alice", T2)], false);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1393,24 +1556,39 @@ mod tests {
 
     #[test]
     fn legacy_bool_unread_true_not_approved_stays_unread() {
+        // arrange
         let stored = StoredReadState::LegacyBool(true);
+
+        // act
         let r = decide(Some(&stored), T1, &[], false);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn legacy_bool_unread_false_not_approved_stays_read() {
+        // arrange
         let stored = StoredReadState::LegacyBool(false);
+
+        // act
         let r = decide(Some(&stored), T1, &[], false);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn legacy_bool_with_approval_marks_read() {
+        // arrange
         let stored = StoredReadState::LegacyBool(true);
+
+        // act
         let r = decide(Some(&stored), T1, &[], true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1419,25 +1597,37 @@ mod tests {
 
     #[test]
     fn new_mr_with_my_requested_changes_is_read_auto() {
+        // act
         let r = decide_with_rc(None, T1, &[], false, true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn auto_state_unchanged_mr_with_my_requested_changes_marks_read() {
+        // arrange
         let stored = full(true, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn auto_state_changed_mr_with_my_requested_changes_and_others_activity_marks_unread() {
-        // key fix-cycle case: I asked for changes, author pushed/replied — back to unread
+        // arrange — key fix-cycle case: I asked for changes, author pushed/replied
         let stored = full(false, T1, ReadStateSource::Auto);
         let other = note("alice", T2);
+
+        // act
         let r = decide_with_rc(Some(&stored), T2, std::slice::from_ref(&other), false, true);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
         assert_eq!(r.latest_actor, Some(other.author.name));
@@ -1445,31 +1635,49 @@ mod tests {
 
     #[test]
     fn auto_state_changed_mr_with_my_requested_changes_and_only_my_activity_marks_read() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide_with_rc(Some(&stored), T2, &[note(ME, T2)], false, true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn approval_takes_precedence_over_requested_changes() {
+        // act
         let r = decide_with_rc(None, T1, &[], true, true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn user_pin_unchanged_mr_with_my_requested_changes_respects_pin() {
+        // arrange
         let stored = full(true, T1, ReadStateSource::User);
+
+        // act
         let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::User);
     }
 
     #[test]
     fn legacy_bool_with_my_requested_changes_marks_read() {
+        // arrange
         let stored = StoredReadState::LegacyBool(true);
+
+        // act
         let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1478,46 +1686,68 @@ mod tests {
 
     #[test]
     fn review_request_pending_marks_unread() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide_with_review_request(Some(&stored), T1, false, Some(1));
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn review_request_overrides_active_approval() {
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
         let r = decide_with_review_request(Some(&stored), T1, true, Some(1));
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn user_pin_unchanged_mr_with_same_review_request_respects_pin() {
-        // user read the MR while this re-request todo was already pending: the todo
-        // id matches the pin anchor, so the pin holds
+        // arrange — user read the MR while this re-request todo was already pending:
+        // the todo id matches the pin anchor, so the pin holds
         let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
+
+        // act
         let r = decide_with_review_request(Some(&stored), T1, false, Some(7));
+
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::User);
     }
 
     #[test]
     fn user_pin_broken_by_new_review_request() {
-        // user read the MR with no re-request pending, then a re-request arrives:
-        // a fresh todo id breaks the pin and marks the MR unread
+        // arrange — user read the MR with no re-request pending, then a re-request
+        // arrives: a fresh todo id breaks the pin and marks the MR unread
         let stored = full_todo(false, T1, ReadStateSource::User, None);
+
+        // act
         let r = decide_with_review_request(Some(&stored), T1, false, Some(9));
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
     fn user_pin_broken_by_changed_review_request_todo() {
-        // user read the MR during one re-request, then the author re-requests again
-        // (new todo id) without touching updated_at: the pin must break
+        // arrange — user read the MR during one re-request, then the author
+        // re-requests again (new todo id) without touching updated_at
         let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
+
+        // act
         let r = decide_with_review_request(Some(&stored), T1, false, Some(9));
+
+        // assert
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1526,35 +1756,48 @@ mod tests {
 
     #[test]
     fn me_requested_changes_returns_true_when_my_state_is_requested_changes() {
+        // arrange
         let reviewers = vec![
             reviewer(2, Some("approved")),
             reviewer(1, Some("requested_changes")),
         ];
+
+        // act / assert
         assert!(me_requested_changes(&reviewers, 1));
     }
 
     #[test]
     fn me_requested_changes_returns_false_for_other_states() {
         for state in ["unreviewed", "reviewed", "approved"] {
+            // arrange
             let reviewers = vec![reviewer(1, Some(state))];
+
+            // act / assert
             assert!(!me_requested_changes(&reviewers, 1));
         }
     }
 
     #[test]
     fn me_requested_changes_returns_false_when_state_missing() {
+        // arrange
         let reviewers = vec![reviewer(1, None)];
+
+        // act / assert
         assert!(!me_requested_changes(&reviewers, 1));
     }
 
     #[test]
     fn me_requested_changes_ignores_other_reviewers_state() {
+        // arrange
         let reviewers = vec![reviewer(2, Some("requested_changes"))];
+
+        // act / assert
         assert!(!me_requested_changes(&reviewers, 1));
     }
 
     #[test]
     fn me_requested_changes_returns_false_for_empty_reviewers() {
+        // act / assert
         assert!(!me_requested_changes(&[], 1));
     }
 
@@ -1629,11 +1872,48 @@ mod tests {
         assert_eq!(todo.author.name, "temp temp");
     }
 
+    // --- notes_to_activity ---
+
+    #[test]
+    fn notes_to_activity_starts_with_synthetic_opened_event() {
+        // arrange
+        let mr = gl_mr();
+
+        // act
+        let events = notes_to_activity(&[], &mr);
+
+        // assert
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].who, mr.author.username);
+        assert_eq!(events[0].time, mr.updated_at);
+        assert!(events[0].text.contains("opened"));
+    }
+
+    #[test]
+    fn notes_to_activity_keeps_newest_20_notes_in_chronological_order() {
+        // arrange — 25 notes, API order is newest-first (sort=desc)
+        let notes: Vec<GitLabNote> = (0..25)
+            .map(|i| note("alice", &format!("2026-03-{:02}T10:00:00Z", 25 - i)))
+            .collect();
+        let mr = gl_mr();
+
+        // act
+        let events = notes_to_activity(&notes, &mr);
+
+        // assert — opened event plus the 20 newest notes, oldest-kept first
+        let note_times: Vec<String> = events[1..].iter().map(|e| e.time.clone()).collect();
+        let expected: Vec<String> = (6..=25)
+            .map(|d| format!("2026-03-{:02}T10:00:00Z", d))
+            .collect();
+        assert_eq!(note_times, expected);
+    }
+
     // --- ReadStateSource round-trip ---
 
     #[test]
     fn read_state_source_roundtrip() {
         for src in [ReadStateSource::User, ReadStateSource::Auto] {
+            // act / assert
             assert_eq!(ReadStateSource::from_stored(src.as_str()), src);
         }
     }

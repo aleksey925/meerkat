@@ -12,7 +12,11 @@ assignee, or mentioned, and sends notifications when something changes.
 ## Features
 
 - System tray icon with unread MR badge
-- Native macOS notifications with sound and click-to-open
+- Native macOS notifications with sound and click-to-open for new review
+  requests, review re-requests, MR updates, and failed pipelines
+- Read/unread tracking that ignores your own actions; marking an MR read by
+  hand can be flipped back to unread by a new re-request or a fresh comment
+  from someone else
 - Periodic background polling with configurable interval
 - MR filtering by project and role (reviewer / assignee / mentioned)
 - Custom reminders for individual merge requests

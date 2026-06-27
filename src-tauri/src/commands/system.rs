@@ -2,7 +2,7 @@ use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_store::StoreExt;
 
-const READ_STATE_STORE: &str = "mr_read_state.json";
+pub(crate) const READ_STATE_STORE: &str = "mr_read_state.json";
 
 fn read_state(
     store: &tauri_plugin_store::Store<tauri::Wry>,
