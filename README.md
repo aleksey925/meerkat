@@ -1,17 +1,22 @@
-Meerkat
-=======
+# Meerkat
 
 A macOS menubar app for tracking GitLab merge requests.
 
-Meerkat lives in your system tray, periodically polls GitLab for MRs where you are a reviewer, 
+Meerkat lives in your system tray, periodically polls GitLab for MRs where you are a reviewer,
 assignee, or mentioned, and sends notifications when something changes.
 
-> This application was generated using Claude Code with no manual code review. Only manual testing was performed.
+- [Features](#features)
+- [Installation](#installation)
+- [Development](#development)
 
 ## Features
 
 - System tray icon with unread MR badge
-- Native macOS notifications with sound and click-to-open
+- Native macOS notifications with sound and click-to-open for new review
+  requests, review re-requests, MR updates, and failed pipelines
+- Read/unread tracking that ignores your own actions; marking an MR read by
+  hand can be flipped back to unread by a new re-request or a fresh comment
+  from someone else
 - Periodic background polling with configurable interval
 - MR filtering by project and role (reviewer / assignee / mentioned)
 - Custom reminders for individual merge requests
@@ -19,38 +24,44 @@ assignee, or mentioned, and sends notifications when something changes.
 - Hides to tray on window close
 - Light and dark theme (follows system)
 
-
 ## Installation
 
-Download the latest release from [releases](https://github.com/aleksey925/meerkat/releases) 
+Download the latest release from [releases](https://github.com/aleksey925/meerkat/releases)
 and install it manually.
 
-> **Note:** Release builds are not signed with an Apple Developer certificate, so macOS Gatekeeper 
+> **Note:** Release builds are not signed with an Apple Developer certificate, so macOS Gatekeeper
 > will show a warning that the app is damaged or can't be opened. To fix this, run:
+>
 > ```bash
 > xattr -cr /Applications/Meerkat.app
 > ```
+>
 > Alternatively, you can [build from source](#build) on your machine to avoid this issue.
-
 
 ## Development
 
-**Prerequisites**
+### Prerequisites
 
-  - macOS
-  - [mise](https://mise.jdx.dev) for managing Node.js and Rust toolchains
-  - Xcode Command Line Tools (`xcode-select --install`)
+- macOS
+- [mise](https://mise.jdx.dev/getting-started.html#installing-mise-cli) for managing toolchains
+- Xcode Command Line Tools (`xcode-select --install`)
 
-### Setup dev environment
+### Set up environment
 
 - install toolchains and deps
 
-    ```bash
-    mise trust && mise install
-    make deps
-    ```
+  ```bash
+  mise trust && mise install
+  make deps
+  ```
 
-- run app in dev mode with hot reload `make dev`
+- verify the setup by running tests
+
+  ```bash
+  make test
+  ```
+
+Now you can run the app in dev mode with hot reload using `make dev`.
 
 ### Build
 

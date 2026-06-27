@@ -13,32 +13,102 @@ static POLLING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CHECK_CYCLE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_MRS: Mutex<Option<Vec<MergeRequest>>> = Mutex::new(None);
 
+pub(crate) fn previous_mr_updated_at_raw(mr_id: i64) -> Option<String> {
+    let prev = PREVIOUS_MRS.lock().ok()?;
+    let mrs = prev.as_ref()?;
+    mrs.iter()
+        .find(|m| m.id == mr_id)
+        .map(|m| m.updated_at_raw.clone())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum NotifyAction {
+    NewMr {
+        author: String,
+        title: String,
+        project: String,
+    },
+    MrUpdated {
+        author: String,
+        title: String,
+    },
+    ReviewRequested {
+        author: String,
+        title: String,
+    },
+    PipelineFailed {
+        title: String,
+    },
+}
+
+fn compute_notifications(
+    new_active: &[MergeRequest],
+    previous: &[MergeRequest],
+) -> Vec<NotifyAction> {
+    let prev_map: HashMap<i64, &MergeRequest> = previous.iter().map(|m| (m.id, m)).collect();
+    let mut actions = Vec::new();
+
+    for mr in new_active {
+        match prev_map.get(&mr.id) {
+            None => {
+                actions.push(NotifyAction::NewMr {
+                    author: mr.author_name.clone(),
+                    title: mr.title.clone(),
+                    project: mr.project_name.clone(),
+                });
+            }
+            Some(prev_mr) => {
+                if mr.updated_at != prev_mr.updated_at {
+                    if let Some(ref author) = mr.latest_actor {
+                        actions.push(NotifyAction::MrUpdated {
+                            author: author.clone(),
+                            title: mr.title.clone(),
+                        });
+                    }
+                }
+                if mr.review_request_todo_id.is_some()
+                    && mr.review_request_todo_id != prev_mr.review_request_todo_id
+                {
+                    let author = mr.review_request_by.as_deref().unwrap_or(&mr.author_name);
+                    actions.push(NotifyAction::ReviewRequested {
+                        author: author.to_string(),
+                        title: mr.title.clone(),
+                    });
+                }
+                if mr.pipeline_status == Some(PipelineStatus::Fail)
+                    && prev_mr.pipeline_status != Some(PipelineStatus::Fail)
+                {
+                    actions.push(NotifyAction::PipelineFailed {
+                        title: mr.title.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    actions
+}
+
 fn detect_changes_and_notify(
     app: &AppHandle,
     new_active: &[MergeRequest],
     previous: &[MergeRequest],
 ) {
-    let prev_map: HashMap<i64, &MergeRequest> = previous.iter().map(|m| (m.id, m)).collect();
-
-    for mr in new_active {
-        match prev_map.get(&mr.id) {
-            None => {
-                notifications::notify_new_mr(
-                    app,
-                    &mr.author_name,
-                    &mr.title,
-                    &mr.project_name,
-                );
+    for action in compute_notifications(new_active, previous) {
+        match action {
+            NotifyAction::NewMr {
+                author,
+                title,
+                project,
+            } => notifications::notify_new_mr(app, &author, &title, &project),
+            NotifyAction::MrUpdated { author, title } => {
+                notifications::notify_mr_updated(app, &author, &title)
             }
-            Some(prev_mr) => {
-                if mr.updated_at != prev_mr.updated_at {
-                    notifications::notify_mr_updated(app, &mr.author_name, &mr.title);
-                }
-                if mr.pipeline_status == Some(PipelineStatus::Fail)
-                    && prev_mr.pipeline_status != Some(PipelineStatus::Fail)
-                {
-                    notifications::notify_pipeline_failed(app, &mr.title);
-                }
+            NotifyAction::ReviewRequested { author, title } => {
+                notifications::notify_review_requested(app, &author, &title)
+            }
+            NotifyAction::PipelineFailed { title } => {
+                notifications::notify_pipeline_failed(app, &title)
             }
         }
     }
@@ -84,22 +154,48 @@ fn check_and_fire_reminders(app: &AppHandle) {
                 Err(_) => continue,
             };
 
-            let title = {
+            let (title, prev_updated_at) = {
                 let prev = PREVIOUS_MRS.lock().ok();
-                prev.as_ref()
+                let mr = prev
+                    .as_ref()
                     .and_then(|opt| opt.as_ref())
-                    .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id))
-                    .map(|m| m.title.clone())
-                    .unwrap_or_else(|| format!("MR #{}", mr_id))
+                    .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id).cloned());
+                match mr {
+                    Some(m) => (m.title, m.updated_at_raw),
+                    None => (format!("MR #{}", mr_id), String::new()),
+                }
             };
 
             notifications::notify_reminder(app, &title);
 
-            // mark as unread
-            if let Ok(read_store) = app.store("mr_read_state.json") {
-                read_store.set(
+            // mark as unread, pinned by user (reminder is treated as a user action).
+            // if PREVIOUS_MRS doesn't have the MR (e.g. first cycle of a fresh session),
+            // preserve the updatedAt that's already in the store so the pin survives the
+            // upcoming fetch.
+            if let Ok(read_store) = app.store(crate::commands::system::READ_STATE_STORE) {
+                let updated_at = if !prev_updated_at.is_empty() {
+                    prev_updated_at
+                } else {
+                    read_store
+                        .get(&key)
+                        .and_then(|v| {
+                            v.as_object().and_then(|o| {
+                                o.get("updatedAt")
+                                    .and_then(|u| u.as_str())
+                                    .map(String::from)
+                            })
+                        })
+                        .unwrap_or_default()
+                };
+                let todo_id =
+                    crate::commands::system::read_review_request_todo_id(&read_store, &key);
+                crate::commands::system::write_state(
+                    &read_store,
                     &key,
-                    serde_json::json!({ "unread": true }),
+                    true,
+                    &updated_at,
+                    "user",
+                    todo_id,
                 );
                 let _ = read_store.save();
             }
@@ -145,7 +241,7 @@ async fn run_check_cycle_inner(app: &AppHandle) -> Result<(), String> {
         Ok(payload) => {
             {
                 let prev = PREVIOUS_MRS.lock().ok();
-                if let Some(ref prev_data) = prev.as_ref().and_then(|o| o.as_ref()) {
+                if let Some(prev_data) = prev.as_ref().and_then(|o| o.as_ref()) {
                     detect_changes_and_notify(app, &payload.active, prev_data);
                 }
             }
@@ -190,7 +286,10 @@ pub fn start_polling_task(app: AppHandle) {
             let poll_secs = {
                 let store = app.store("settings.json").ok();
                 store
-                    .and_then(|s| s.get("poll_interval").and_then(|v| v.as_str().map(String::from)))
+                    .and_then(|s| {
+                        s.get("poll_interval")
+                            .and_then(|v| v.as_str().map(String::from))
+                    })
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(30)
             };
@@ -221,4 +320,261 @@ pub fn stop_polling() -> Result<(), String> {
 #[tauri::command]
 pub async fn check_now(app: AppHandle) -> Result<(), String> {
     run_check_cycle(&app, true).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{MrStatus, UserRole};
+
+    fn mr(id: i64, updated_at: &str) -> MergeRequest {
+        MergeRequest {
+            id,
+            iid: id,
+            project_id: 1,
+            project_name: "proj".to_string(),
+            project_namespace: "ns".to_string(),
+            title: format!("MR {id}"),
+            source_branch: "src".to_string(),
+            target_branch: "main".to_string(),
+            author_name: "Author".to_string(),
+            author_username: "author".to_string(),
+            role: UserRole::Reviewer,
+            status: MrStatus::Open,
+            draft: false,
+            has_conflicts: false,
+            pipeline_status: None,
+            approvals_current: 0,
+            approvals_required: 0,
+            web_url: String::new(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(updated_at)
+                .unwrap()
+                .with_timezone(&Utc),
+            unread: true,
+            reminder: None,
+            activity: Vec::new(),
+            latest_actor: None,
+            updated_at_raw: updated_at.to_string(),
+            review_request_todo_id: None,
+            review_request_by: None,
+        }
+    }
+
+    const T1: &str = "2026-01-01T10:00:00Z";
+    const T2: &str = "2026-01-02T10:00:00Z";
+
+    #[test]
+    fn new_mr_fires_new_mr_notification() {
+        // arrange
+        let new = mr(1, T1);
+
+        // act
+        let actions = compute_notifications(std::slice::from_ref(&new), &[]);
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![NotifyAction::NewMr {
+                author: new.author_name.clone(),
+                title: new.title.clone(),
+                project: new.project_name.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn updated_at_change_with_actor_fires_mr_updated() {
+        // arrange
+        let prev = mr(1, T1);
+        let mut new = mr(1, T2);
+        new.latest_actor = Some("Alice".to_string());
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![NotifyAction::MrUpdated {
+                author: new.latest_actor.clone().unwrap(),
+                title: new.title.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn updated_at_change_without_actor_fires_nothing() {
+        // arrange — own action: updated_at moved but no actor attributed
+        let prev = mr(1, T1);
+        let new = mr(1, T2);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn new_review_request_todo_fires_review_requested() {
+        // arrange
+        let prev = mr(1, T1);
+        let mut new = mr(1, T1);
+        new.review_request_todo_id = Some(5);
+        new.review_request_by = Some("Bob".to_string());
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![NotifyAction::ReviewRequested {
+                author: new.review_request_by.clone().unwrap(),
+                title: new.title.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn review_request_falls_back_to_author_name() {
+        // arrange
+        let prev = mr(1, T1);
+        let mut new = mr(1, T1);
+        new.review_request_todo_id = Some(5);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![NotifyAction::ReviewRequested {
+                author: new.author_name.clone(),
+                title: new.title.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cleared_review_request_todo_fires_nothing() {
+        // arrange — todo went Some(5) -> None: the is_some() guard suppresses it
+        let mut prev = mr(1, T1);
+        prev.review_request_todo_id = Some(5);
+        let new = mr(1, T1);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn unchanged_review_request_todo_fires_nothing() {
+        // arrange
+        let mut prev = mr(1, T1);
+        prev.review_request_todo_id = Some(5);
+        let mut new = mr(1, T1);
+        new.review_request_todo_id = Some(5);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn combined_update_and_new_review_request_fires_both() {
+        // arrange — updated_at moved with an actor AND a fresh re-request todo
+        let prev = mr(1, T1);
+        let mut new = mr(1, T2);
+        new.latest_actor = Some("Alice".to_string());
+        new.review_request_todo_id = Some(9);
+        new.review_request_by = Some("Bob".to_string());
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![
+                NotifyAction::MrUpdated {
+                    author: new.latest_actor.clone().unwrap(),
+                    title: new.title.clone(),
+                },
+                NotifyAction::ReviewRequested {
+                    author: new.review_request_by.clone().unwrap(),
+                    title: new.title.clone(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_pass_to_fail_fires_pipeline_failed() {
+        // arrange
+        let mut prev = mr(1, T1);
+        prev.pipeline_status = Some(PipelineStatus::Pass);
+        let mut new = mr(1, T1);
+        new.pipeline_status = Some(PipelineStatus::Fail);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![NotifyAction::PipelineFailed {
+                title: new.title.clone()
+            }]
+        );
+    }
+
+    #[test]
+    fn pipeline_pending_to_fail_fires_pipeline_failed() {
+        // arrange
+        let mut prev = mr(1, T1);
+        prev.pipeline_status = Some(PipelineStatus::Pending);
+        let mut new = mr(1, T1);
+        new.pipeline_status = Some(PipelineStatus::Fail);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert_eq!(
+            actions,
+            vec![NotifyAction::PipelineFailed {
+                title: new.title.clone()
+            }]
+        );
+    }
+
+    #[test]
+    fn pipeline_fail_to_fail_fires_nothing() {
+        // arrange — already failing, no fresh transition
+        let mut prev = mr(1, T1);
+        prev.pipeline_status = Some(PipelineStatus::Fail);
+        let mut new = mr(1, T1);
+        new.pipeline_status = Some(PipelineStatus::Fail);
+
+        // act
+        let actions =
+            compute_notifications(std::slice::from_ref(&new), std::slice::from_ref(&prev));
+
+        // assert
+        assert!(actions.is_empty());
+    }
 }

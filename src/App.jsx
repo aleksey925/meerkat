@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
 import "./App.css";
 import formatDateTime from "./utils/formatDateTime";
@@ -577,7 +577,7 @@ export default function App() {
   const [appVersion, setAppVersion] = useState("0.0.0");
   const toastTimer = useRef(null);
 
-  useEffect(() => { getVersion().then(setAppVersion); }, []);
+  useEffect(() => { invoke("get_app_version").then(setAppVersion); }, []);
 
   const showToast = useCallback((msg, duration = 2500) => {
     setToast(msg);

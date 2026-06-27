@@ -121,10 +121,7 @@ async fn fetch_mrs_by_scope(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
 
-        let mrs: Vec<GitLabMr> = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {e}"))?;
+        let mrs: Vec<GitLabMr> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         if mrs.is_empty() {
             break;
@@ -172,10 +169,7 @@ async fn fetch_mentioned_mrs(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
 
-        let mrs: Vec<GitLabMr> = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {e}"))?;
+        let mrs: Vec<GitLabMr> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         if mrs.is_empty() {
             break;
@@ -219,12 +213,19 @@ async fn fetch_pipeline_status(
     })
 }
 
+struct ApprovalInfo {
+    current: u32,
+    required: u32,
+    approved_by_me: bool,
+}
+
 async fn fetch_approvals(
     client: &Client,
     base_url: &str,
     project_id: i64,
     mr_iid: i64,
-) -> (u32, u32) {
+    current_uid: i64,
+) -> ApprovalInfo {
     let url = format!(
         "{}/api/v4/projects/{}/merge_requests/{}/approvals",
         base_url, project_id, mr_iid
@@ -232,22 +233,158 @@ async fn fetch_approvals(
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(_) => return (0, 0),
+        Err(_) => {
+            return ApprovalInfo {
+                current: 0,
+                required: 0,
+                approved_by_me: false,
+            }
+        }
     };
 
     let approvals: GitLabApprovals = match resp.json().await {
         Ok(a) => a,
-        Err(_) => return (0, 0),
+        Err(_) => {
+            return ApprovalInfo {
+                current: 0,
+                required: 0,
+                approved_by_me: false,
+            }
+        }
     };
 
-    let current = approvals
-        .approved_by
-        .as_ref()
-        .map(|v| v.len() as u32)
-        .unwrap_or(0);
+    let approved_by = approvals.approved_by.as_deref().unwrap_or_default();
+    let current = approved_by.len() as u32;
     let required = approvals.approvals_required.unwrap_or(0) as u32;
+    let approved_by_me = approved_by.iter().any(|a| a.user.id == current_uid);
 
-    (current, required)
+    ApprovalInfo {
+        current,
+        required,
+        approved_by_me,
+    }
+}
+
+async fn fetch_reviewer_states(
+    client: &Client,
+    base_url: &str,
+    project_id: i64,
+    mr_iid: i64,
+) -> Vec<GitLabReviewerState> {
+    let mut all = Vec::new();
+    let mut page = 1u32;
+
+    loop {
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}/reviewers?per_page=100&page={}",
+            base_url, project_id, mr_iid, page
+        );
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if !resp.status().is_success() {
+            break;
+        }
+
+        let next_page = resp
+            .headers()
+            .get("x-next-page")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+
+        let reviewers: Vec<GitLabReviewerState> = match resp.json().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if reviewers.is_empty() {
+            break;
+        }
+
+        all.extend(reviewers);
+
+        match next_page {
+            Some(np) if np > page => page = np,
+            _ => break,
+        }
+    }
+
+    all
+}
+
+fn me_requested_changes(reviewers: &[GitLabReviewerState], current_uid: i64) -> bool {
+    reviewers
+        .iter()
+        .any(|r| r.user.id == current_uid && r.state.as_deref() == Some("requested_changes"))
+}
+
+struct ReviewRequest {
+    todo_id: i64,
+    by: String,
+}
+
+// pending "review requested" todos keyed by MR global id. a re-request doesn't
+// move the MR's updated_at and leaves no note we can attribute, so the todo is
+// the only reliable signal that the author asked me to review again.
+async fn fetch_review_request_todos(
+    client: &Client,
+    base_url: &str,
+) -> HashMap<i64, ReviewRequest> {
+    let mut map = HashMap::new();
+    let mut page = 1u32;
+
+    loop {
+        let url = format!(
+            "{}/api/v4/todos?state=pending&action=review_requested&per_page=100&page={}",
+            base_url, page
+        );
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if !resp.status().is_success() {
+            break;
+        }
+
+        let next_page = resp
+            .headers()
+            .get("x-next-page")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+
+        let todos: Vec<GitLabTodo> = match resp.json().await {
+            Ok(t) => t,
+            Err(_) => break,
+        };
+
+        if todos.is_empty() {
+            break;
+        }
+
+        for todo in todos {
+            if todo.target_type == "MergeRequest" && todo.action_name == "review_requested" {
+                map.insert(
+                    todo.target.id,
+                    ReviewRequest {
+                        todo_id: todo.id,
+                        by: todo.author.name,
+                    },
+                );
+            }
+        }
+
+        match next_page {
+            Some(np) if np > page => page = np,
+            _ => break,
+        }
+    }
+
+    map
 }
 
 async fn fetch_notes(
@@ -257,7 +394,7 @@ async fn fetch_notes(
     mr_iid: i64,
 ) -> Vec<GitLabNote> {
     let url = format!(
-        "{}/api/v4/projects/{}/merge_requests/{}/notes?sort=asc&per_page=50",
+        "{}/api/v4/projects/{}/merge_requests/{}/notes?sort=desc&per_page=50",
         base_url, project_id, mr_iid
     );
 
@@ -324,7 +461,7 @@ fn color_for_project(index: usize) -> &'static str {
 }
 
 fn make_initials(name: &str) -> String {
-    name.split(|c: char| c == '-' || c == '_' || c == ' ')
+    name.split(['-', '_', ' '])
         .filter(|s| !s.is_empty())
         .take(2)
         .map(|s| s.chars().next().unwrap_or('?').to_uppercase().to_string())
@@ -341,7 +478,7 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
         color: "#5e5ce6".to_string(),
     });
 
-    for note in notes.iter().take(20) {
+    for note in notes.iter().take(20).rev() {
         let is_system = note.system.unwrap_or(false);
         events.push(ActivityEvent {
             who: if is_system {
@@ -366,40 +503,254 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
     events
 }
 
+fn find_latest_activity_from_others(
+    notes: &[GitLabNote],
+    current_username: &str,
+    since: &str,
+) -> Option<String> {
+    // notes are sorted desc (newest first). only the single most recent note
+    // counts: if my own comment is the latest activity, there is nothing to
+    // attribute to others. skipping my note to surface an older one would let
+    // my own comment fire a notification naming whoever spoke before me.
+    let note = notes.first()?;
+    if note.created_at.as_str() <= since || note.author.username == current_username {
+        return None;
+    }
+    Some(note.author.name.clone())
+}
+
+// newest human comment from someone else, but only if it is newer than my own
+// most recent action (comment, approval, review). used to wake an approved MR:
+// a real message should reach me, while my own approval and automated system
+// notes (CI, pushes, label changes) must not.
+fn find_latest_comment_from_others(
+    notes: &[GitLabNote],
+    current_username: &str,
+    since: &str,
+) -> Option<String> {
+    for note in notes {
+        if note.created_at.as_str() <= since {
+            break;
+        }
+        if note.author.username == current_username {
+            // I acted more recently than any other comment here — up to date
+            return None;
+        }
+        if !note.system.unwrap_or(false) {
+            return Some(note.author.name.clone());
+        }
+        // a system note from someone else (push, label) — not a comment, keep
+        // scanning older notes for an actual message
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReadStateSource {
+    User,
+    Auto,
+}
+
+impl ReadStateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReadStateSource::User => "user",
+            ReadStateSource::Auto => "auto",
+        }
+    }
+
+    fn from_stored(s: &str) -> Self {
+        match s {
+            "user" => ReadStateSource::User,
+            _ => ReadStateSource::Auto,
+        }
+    }
+}
+
+struct ReadStatus {
+    unread: bool,
+    latest_actor: Option<String>,
+    source: ReadStateSource,
+}
+
+#[derive(Clone, Copy)]
+struct ReadSignals {
+    approved_by_me: bool,
+    i_requested_changes: bool,
+    review_request_todo_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum StoredReadState {
+    Full {
+        unread: bool,
+        updated_at: String,
+        source: ReadStateSource,
+        review_request_todo_id: Option<i64>,
+    },
+    LegacyBool(bool),
+}
+
+fn parse_stored_read_state(val: &serde_json::Value) -> Option<StoredReadState> {
+    if let Some(obj) = val.as_object() {
+        let unread = obj.get("unread").and_then(|v| v.as_bool()).unwrap_or(true);
+        let updated_at = obj
+            .get("updatedAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let source = obj
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(ReadStateSource::from_stored)
+            .unwrap_or(ReadStateSource::Auto);
+        let review_request_todo_id = obj.get("reviewRequestTodoId").and_then(|v| v.as_i64());
+        return Some(StoredReadState::Full {
+            unread,
+            updated_at,
+            source,
+            review_request_todo_id,
+        });
+    }
+    if let Some(b) = val.as_bool() {
+        return Some(StoredReadState::LegacyBool(b));
+    }
+    None
+}
+
+fn decide_unread_status(
+    stored: Option<&StoredReadState>,
+    updated_at: &str,
+    notes: &[GitLabNote],
+    current_username: &str,
+    signals: ReadSignals,
+) -> ReadStatus {
+    let (stored_unread, stored_updated, stored_source, stored_todo) = match stored {
+        Some(StoredReadState::Full {
+            unread,
+            updated_at,
+            source,
+            review_request_todo_id,
+        }) => (
+            Some(*unread),
+            Some(updated_at.as_str()),
+            Some(*source),
+            *review_request_todo_id,
+        ),
+        Some(StoredReadState::LegacyBool(b)) => (Some(*b), None, None, None),
+        None => (None, None, None, None),
+    };
+
+    // 1. user pinned the state and MR hasn't changed - respect it. the pin is
+    // anchored to the review-request todo too: a fresh re-request keeps the same
+    // updated_at and leaves no note, so without this a manually-read MR would
+    // stay read while the re-request notification fires (read state and todo
+    // would disagree).
+    if let (Some(unread), Some(stored_ts), Some(ReadStateSource::User)) =
+        (stored_unread, stored_updated, stored_source)
+    {
+        if stored_ts == updated_at && stored_todo == signals.review_request_todo_id {
+            return ReadStatus {
+                unread,
+                latest_actor: None,
+                source: ReadStateSource::User,
+            };
+        }
+    }
+
+    // 2. a re-request review is pending for me — unread. sits above approval
+    // because a re-request means the author wants another look even if a stale
+    // approval is still on record. notification is driven separately by the
+    // todo id (re-request leaves no note and doesn't move updated_at).
+    if signals.review_request_todo_id.is_some() {
+        return ReadStatus {
+            unread: true,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
+    }
+
+    // 3. someone else left a real comment since I last looked — unread + notify,
+    // even if I have approved. approval should silence CI/push noise, not a human
+    // message; pushes are handled below because GitLab resets my approval on push.
+    if let Some(stored_ts) = stored_updated {
+        if stored_ts != updated_at {
+            if let Some(actor) = find_latest_comment_from_others(notes, current_username, stored_ts)
+            {
+                return ReadStatus {
+                    unread: true,
+                    latest_actor: Some(actor),
+                    source: ReadStateSource::Auto,
+                };
+            }
+        }
+    }
+
+    // 4. active approval from me — auto-read (GitLab resets approval on push,
+    // so the next "real" activity will fall through to step 5 naturally)
+    if signals.approved_by_me {
+        return ReadStatus {
+            unread: false,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
+    }
+
+    // 5. MR changed since last fetch and someone else acted — auto-unread
+    if let Some(stored_ts) = stored_updated {
+        if stored_ts != updated_at {
+            let latest_actor = find_latest_activity_from_others(notes, current_username, stored_ts);
+            if latest_actor.is_some() {
+                return ReadStatus {
+                    unread: true,
+                    latest_actor,
+                    source: ReadStateSource::Auto,
+                };
+            }
+        }
+    }
+
+    // 6. I left a "request changes" review — auto-read. Sits below activity-from-others
+    // so any reaction from the author (push, comment) flips it back to unread for the
+    // next round of the fix cycle.
+    if signals.i_requested_changes {
+        return ReadStatus {
+            unread: false,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
+    }
+
+    // 7. fallback — keep stored, default to unread for new MRs
+    ReadStatus {
+        unread: stored_unread.unwrap_or(true),
+        latest_actor: None,
+        source: ReadStateSource::Auto,
+    }
+}
+
 fn resolve_unread_status(
     app: &AppHandle,
     mr_id: i64,
     updated_at: &str,
-) -> bool {
-    let read_store = app.store("mr_read_state.json").ok();
+    notes: &[GitLabNote],
+    current_username: &str,
+    signals: ReadSignals,
+) -> ReadStatus {
+    let read_store = app.store(crate::commands::system::READ_STATE_STORE).ok();
     let key = mr_id.to_string();
-
-    if let Some(ref store) = read_store {
-        if let Some(val) = store.get(&key) {
-            // stored as {unread: bool, updatedAt: string} or just bool (legacy)
-            if let Some(obj) = val.as_object() {
-                let stored_unread = obj
-                    .get("unread")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let stored_updated = obj
-                    .get("updatedAt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                // if updated_at changed since last store, mark unread again
-                if stored_updated != updated_at {
-                    return true;
-                }
-                return stored_unread;
-            }
-            // legacy format: just a bool (false = read)
-            if let Some(unread_val) = val.as_bool() {
-                return unread_val;
-            }
-        }
-    }
-    // new MR — unread
-    true
+    let stored = read_store
+        .as_ref()
+        .and_then(|s| s.get(&key))
+        .as_ref()
+        .and_then(parse_stored_read_state);
+    decide_unread_status(
+        stored.as_ref(),
+        updated_at,
+        notes,
+        current_username,
+        signals,
+    )
 }
 
 fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
@@ -412,13 +763,22 @@ fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
     val.as_str().map(String::from)
 }
 
-fn persist_read_state(app: &AppHandle, mr_id: i64, unread: bool, updated_at: &str) {
-    if let Ok(store) = app.store("mr_read_state.json") {
+fn persist_read_state(
+    app: &AppHandle,
+    mr_id: i64,
+    unread: bool,
+    updated_at: &str,
+    source: ReadStateSource,
+    review_request_todo_id: Option<i64>,
+) {
+    if let Ok(store) = app.store(crate::commands::system::READ_STATE_STORE) {
         store.set(
-            &mr_id.to_string(),
+            mr_id.to_string(),
             serde_json::json!({
                 "unread": unread,
                 "updatedAt": updated_at,
+                "source": source.as_str(),
+                "reviewRequestTodoId": review_request_todo_id,
             }),
         );
         let _ = store.save();
@@ -473,8 +833,8 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
 
     for mr in reviewer_mrs
         .into_iter()
-        .chain(assignee_mrs.into_iter())
-        .chain(mentioned_mrs.into_iter())
+        .chain(assignee_mrs)
+        .chain(mentioned_mrs)
     {
         if seen.insert(mr.id) {
             all_gitlab_mrs.push(mr);
@@ -510,35 +870,56 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         .collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
+    let review_request_todos = fetch_review_request_todos(&client, &base_url).await;
+
     // Build MRs with details
     let mut active = Vec::new();
 
     for gl_mr in &all_gitlab_mrs {
+        let review_request = review_request_todos.get(&gl_mr.id);
         let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
-        let (approvals_current, approvals_required) =
-            fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
-        let pipeline =
-            fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let approval_info =
+            fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
+        let pipeline = fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let reviewer_states =
+            fetch_reviewer_states(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let requested_changes = me_requested_changes(&reviewer_states, uid);
         let role = determine_role(gl_mr, uid, &username, &notes);
-        let status = determine_status(gl_mr, approvals_current, approvals_required);
+        let status = determine_status(gl_mr, approval_info.current, approval_info.required);
         let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
 
         let proj = project_cache.get(&gl_mr.project_id);
         let project_name = proj.map(|p| p.name.clone()).unwrap_or_default();
-        let project_namespace = proj
-            .map(|p| p.namespace.name.clone())
-            .unwrap_or_default();
+        let project_namespace = proj.map(|p| p.namespace.name.clone()).unwrap_or_default();
 
         let activity = notes_to_activity(&notes, gl_mr);
 
-        let unread = resolve_unread_status(&app, gl_mr.id, &gl_mr.updated_at);
+        let read_status = resolve_unread_status(
+            &app,
+            gl_mr.id,
+            &gl_mr.updated_at,
+            &notes,
+            &username,
+            ReadSignals {
+                approved_by_me: approval_info.approved_by_me,
+                i_requested_changes: requested_changes,
+                review_request_todo_id: review_request.map(|r| r.todo_id),
+            },
+        );
         let reminder = resolve_reminder(&app, gl_mr.id);
 
         let updated_at = chrono::DateTime::parse_from_rfc3339(&gl_mr.updated_at)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
 
-        persist_read_state(&app, gl_mr.id, unread, &gl_mr.updated_at);
+        persist_read_state(
+            &app,
+            gl_mr.id,
+            read_status.unread,
+            &gl_mr.updated_at,
+            read_status.source,
+            review_request.map(|r| r.todo_id),
+        );
 
         let mr = MergeRequest {
             id: gl_mr.id,
@@ -556,23 +937,984 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             draft: is_draft,
             has_conflicts: gl_mr.has_conflicts.unwrap_or(false),
             pipeline_status: pipeline,
-            approvals_current,
-            approvals_required,
+            approvals_current: approval_info.current,
+            approvals_required: approval_info.required,
             web_url: gl_mr.web_url.clone(),
             updated_at,
-            unread,
+            unread: read_status.unread,
             reminder,
             activity,
+            latest_actor: read_status.latest_actor,
+            updated_at_raw: gl_mr.updated_at.clone(),
+            review_request_todo_id: review_request.map(|r| r.todo_id),
+            review_request_by: review_request.map(|r| r.by.clone()),
         };
 
         active.push(mr);
     }
 
     // Sort by updated_at desc
-    active.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    active.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
-    Ok(MrUpdatePayload {
-        active,
-        projects,
-    })
+    Ok(MrUpdatePayload { active, projects })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ME: &str = "me";
+    const T1: &str = "2026-01-01T10:00:00Z";
+    const T2: &str = "2026-01-02T10:00:00Z";
+    const T3: &str = "2026-01-03T10:00:00Z";
+
+    fn note(username: &str, created_at: &str) -> GitLabNote {
+        GitLabNote {
+            id: 1,
+            body: String::new(),
+            author: GitLabUser {
+                id: 1,
+                username: username.to_string(),
+                name: format!("Name {username}"),
+                avatar_url: String::new(),
+            },
+            created_at: created_at.to_string(),
+            system: None,
+            noteable_type: None,
+        }
+    }
+
+    fn system_note(username: &str, created_at: &str) -> GitLabNote {
+        GitLabNote {
+            system: Some(true),
+            ..note(username, created_at)
+        }
+    }
+
+    fn full(unread: bool, updated_at: &str, source: ReadStateSource) -> StoredReadState {
+        StoredReadState::Full {
+            unread,
+            updated_at: updated_at.to_string(),
+            source,
+            review_request_todo_id: None,
+        }
+    }
+
+    fn full_todo(
+        unread: bool,
+        updated_at: &str,
+        source: ReadStateSource,
+        review_request_todo_id: Option<i64>,
+    ) -> StoredReadState {
+        StoredReadState::Full {
+            unread,
+            updated_at: updated_at.to_string(),
+            source,
+            review_request_todo_id,
+        }
+    }
+
+    fn decide(
+        stored: Option<&StoredReadState>,
+        updated_at: &str,
+        notes: &[GitLabNote],
+        approved_by_me: bool,
+    ) -> ReadStatus {
+        decide_unread_status(
+            stored,
+            updated_at,
+            notes,
+            ME,
+            ReadSignals {
+                approved_by_me,
+                i_requested_changes: false,
+                review_request_todo_id: None,
+            },
+        )
+    }
+
+    fn decide_with_rc(
+        stored: Option<&StoredReadState>,
+        updated_at: &str,
+        notes: &[GitLabNote],
+        approved_by_me: bool,
+        i_requested_changes: bool,
+    ) -> ReadStatus {
+        decide_unread_status(
+            stored,
+            updated_at,
+            notes,
+            ME,
+            ReadSignals {
+                approved_by_me,
+                i_requested_changes,
+                review_request_todo_id: None,
+            },
+        )
+    }
+
+    fn decide_with_review_request(
+        stored: Option<&StoredReadState>,
+        updated_at: &str,
+        approved_by_me: bool,
+        review_request_todo_id: Option<i64>,
+    ) -> ReadStatus {
+        decide_unread_status(
+            stored,
+            updated_at,
+            &[],
+            ME,
+            ReadSignals {
+                approved_by_me,
+                i_requested_changes: false,
+                review_request_todo_id,
+            },
+        )
+    }
+
+    fn gl_mr() -> GitLabMr {
+        GitLabMr {
+            id: 1,
+            iid: 1,
+            title: "Title".to_string(),
+            source_branch: "src".to_string(),
+            target_branch: "main".to_string(),
+            author: GitLabUser {
+                id: 99,
+                username: "author".to_string(),
+                name: "Author Name".to_string(),
+                avatar_url: String::new(),
+            },
+            reviewers: None,
+            assignees: None,
+            state: "opened".to_string(),
+            draft: None,
+            work_in_progress: None,
+            has_conflicts: None,
+            web_url: String::new(),
+            updated_at: T3.to_string(),
+            project_id: 1,
+        }
+    }
+
+    fn reviewer(uid: i64, state: Option<&str>) -> GitLabReviewerState {
+        GitLabReviewerState {
+            user: GitLabUser {
+                id: uid,
+                username: format!("user{}", uid),
+                name: format!("User {}", uid),
+                avatar_url: String::new(),
+            },
+            state: state.map(String::from),
+        }
+    }
+
+    // --- find_latest_activity_from_others ---
+
+    #[test]
+    fn find_latest_activity_from_others_empty_notes_returns_none() {
+        // act
+        let actor = find_latest_activity_from_others(&[], ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_only_my_notes_returns_none() {
+        // arrange
+        let notes = vec![note(ME, T3), note(ME, T2)];
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_returns_none_when_my_note_is_newest() {
+        // arrange — my own comment is the latest activity: nothing to attribute to
+        // others, otherwise my comment would notify me naming whoever spoke before me
+        let notes = vec![note(ME, T3), note("alice", T2)];
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_skips_notes_at_or_before_since() {
+        // arrange
+        let notes = vec![note("alice", T1)];
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn find_latest_activity_from_others_picks_most_recent_when_multiple_others() {
+        // arrange — first note in desc-sorted list is the newest
+        let newest_other = note("alice", T3);
+        let older_other = note("bob", T2);
+        let notes = vec![newest_other.clone(), older_other];
+
+        // act
+        let actor = find_latest_activity_from_others(&notes, ME, T1);
+
+        // assert
+        assert_eq!(actor, Some(newest_other.author.name));
+    }
+
+    // --- find_latest_comment_from_others ---
+
+    #[test]
+    fn find_latest_comment_returns_human_comment_from_others() {
+        // arrange
+        let other = note("alice", T2);
+
+        // act
+        let actor = find_latest_comment_from_others(std::slice::from_ref(&other), ME, T1);
+
+        // assert
+        assert_eq!(actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn find_latest_comment_skips_others_system_note_for_older_comment() {
+        // arrange — a push (system) on top of a real comment still surfaces the comment
+        let comment = note("alice", T2);
+        let notes = vec![system_note("alice", T3), comment.clone()];
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert_eq!(actor, Some(comment.author.name));
+    }
+
+    #[test]
+    fn find_latest_comment_returns_none_when_only_others_system_notes() {
+        // arrange
+        let notes = vec![system_note("alice", T3)];
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn find_latest_comment_returns_none_when_my_action_is_newest() {
+        // arrange — my approval (system, mine) on top of others' comment — I'm up to date
+        let notes = vec![system_note(ME, T3), note("alice", T2)];
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    #[test]
+    fn find_latest_comment_returns_none_at_or_before_since() {
+        // arrange
+        let notes = vec![note("alice", T1)];
+
+        // act
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+
+        // assert
+        assert!(actor.is_none());
+    }
+
+    // --- parse_stored_read_state ---
+
+    #[test]
+    fn parse_full_object_extracts_all_fields() {
+        // arrange
+        let val = serde_json::json!({
+            "unread": false,
+            "updatedAt": T1,
+            "source": "user",
+        });
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(false, T1, ReadStateSource::User)));
+    }
+
+    #[test]
+    fn parse_full_object_extracts_review_request_todo_id() {
+        // arrange
+        let val = serde_json::json!({
+            "unread": false,
+            "updatedAt": T1,
+            "source": "user",
+            "reviewRequestTodoId": 42,
+        });
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(
+            parsed,
+            Some(full_todo(false, T1, ReadStateSource::User, Some(42)))
+        );
+    }
+
+    #[test]
+    fn parse_object_missing_source_defaults_to_auto() {
+        // arrange
+        let val = serde_json::json!({ "unread": true, "updatedAt": T1 });
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(true, T1, ReadStateSource::Auto)));
+    }
+
+    #[test]
+    fn parse_object_unknown_source_defaults_to_auto() {
+        // arrange
+        let val = serde_json::json!({ "unread": true, "updatedAt": T1, "source": "weird" });
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(true, T1, ReadStateSource::Auto)));
+    }
+
+    #[test]
+    fn parse_object_missing_updated_at_defaults_to_empty() {
+        // arrange
+        let val = serde_json::json!({ "unread": true });
+
+        // act
+        let parsed = parse_stored_read_state(&val);
+
+        // assert
+        assert_eq!(parsed, Some(full(true, "", ReadStateSource::Auto)));
+    }
+
+    #[test]
+    fn parse_legacy_bool_returns_legacy_variant() {
+        // act
+        let parsed_false = parse_stored_read_state(&serde_json::Value::Bool(false));
+        let parsed_true = parse_stored_read_state(&serde_json::Value::Bool(true));
+
+        // assert
+        assert_eq!(parsed_false, Some(StoredReadState::LegacyBool(false)));
+        assert_eq!(parsed_true, Some(StoredReadState::LegacyBool(true)));
+    }
+
+    #[test]
+    fn parse_unknown_value_returns_none() {
+        // act / assert
+        assert_eq!(parse_stored_read_state(&serde_json::Value::Null), None);
+        assert_eq!(parse_stored_read_state(&serde_json::json!("string")), None);
+        assert_eq!(parse_stored_read_state(&serde_json::json!(42)), None);
+    }
+
+    // --- decide_unread_status: new MR ---
+
+    #[test]
+    fn new_mr_not_approved_is_unread_auto() {
+        // act
+        let r = decide(None, T1, &[], false);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn new_mr_approved_is_read_auto() {
+        // act
+        let r = decide(None, T1, &[], true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: user pin ---
+
+    #[test]
+    fn user_pin_unchanged_mr_respected_even_when_approved() {
+        // arrange
+        let stored = full(true, T1, ReadStateSource::User);
+
+        // act
+        let r = decide(Some(&stored), T1, &[note("alice", T2)], true);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn user_pin_to_read_unchanged_mr_respected() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::User);
+
+        // act
+        let r = decide(Some(&stored), T1, &[note("alice", T2)], false);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn user_pin_invalidated_then_approval_marks_read() {
+        // arrange — pin valid for T1, but MR is now at T2; pin holds only while updatedAt matches
+        let stored = full(true, T1, ReadStateSource::User);
+
+        // act
+        let r = decide(Some(&stored), T2, &[], true);
+
+        // assert — approval kicks in next, marks read
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_invalidated_then_others_activity_marks_unread() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::User);
+        let other = note("alice", T2);
+
+        // act
+        let r = decide(Some(&stored), T2, std::slice::from_ref(&other), false);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn user_pin_invalidated_with_only_my_activity_keeps_stored_unread() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::User);
+
+        // act
+        let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: approval auto-mark ---
+
+    #[test]
+    fn auto_state_unchanged_mr_with_approval_marks_read() {
+        // arrange
+        let stored = full(true, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide(Some(&stored), T1, &[], true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn approval_keeps_read_when_only_system_notes_follow() {
+        // arrange — approval silences CI/push noise: a system note from another
+        // must not resurface the MR
+        let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide(Some(&stored), T2, &[system_note("alice", T2)], true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn approval_does_not_silence_human_comment_from_others() {
+        // arrange — a real comment must reach me even after I approved (matches user's spec)
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let other = note("alice", T2);
+
+        // act
+        let r = decide(Some(&stored), T2, std::slice::from_ref(&other), true);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn approval_then_my_own_comment_stays_read() {
+        // arrange — approving and then commenting myself: I'm up to date, no resurface
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let notes = [note(ME, T3), system_note(ME, T2)];
+
+        // act
+        let r = decide(Some(&stored), T3, &notes, true);
+
+        // assert
+        assert!(!r.unread);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn approval_with_others_comment_before_my_action_stays_read() {
+        // arrange — others commented, then I approved on top; I've seen it, stay read
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let notes = [system_note(ME, T3), note("alice", T2)];
+
+        // act
+        let r = decide(Some(&stored), T3, &notes, true);
+
+        // assert
+        assert!(!r.unread);
+        assert!(r.latest_actor.is_none());
+    }
+
+    // --- decide_unread_status: activity from others ---
+
+    #[test]
+    fn auto_state_changed_mr_with_others_activity_marks_unread() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let other = note("alice", T2);
+
+        // act
+        let r = decide(Some(&stored), T2, std::slice::from_ref(&other), false);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_only_my_activity_keeps_stored_unread() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn my_comment_after_others_note_does_not_set_actor() {
+        // arrange — user pinned unread, then commented themselves: must stay unread
+        // but expose no actor, so polling won't fire a notification for my own comment
+        let stored = full(true, T1, ReadStateSource::User);
+
+        // act
+        let r = decide(Some(&stored), T3, &[note(ME, T3), note("alice", T2)], false);
+
+        // assert
+        assert!(r.unread);
+        assert!(r.latest_actor.is_none());
+    }
+
+    // --- decide_unread_status: unchanged MR without pin/approval ---
+
+    #[test]
+    fn auto_state_unchanged_mr_no_approval_keeps_stored_unread() {
+        // arrange
+        let stored = full(true, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide(Some(&stored), T1, &[note("alice", T2)], false);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: legacy bool ---
+
+    #[test]
+    fn legacy_bool_unread_true_not_approved_stays_unread() {
+        // arrange
+        let stored = StoredReadState::LegacyBool(true);
+
+        // act
+        let r = decide(Some(&stored), T1, &[], false);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn legacy_bool_unread_false_not_approved_stays_read() {
+        // arrange
+        let stored = StoredReadState::LegacyBool(false);
+
+        // act
+        let r = decide(Some(&stored), T1, &[], false);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn legacy_bool_with_approval_marks_read() {
+        // arrange
+        let stored = StoredReadState::LegacyBool(true);
+
+        // act
+        let r = decide(Some(&stored), T1, &[], true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: requested_changes by me ---
+
+    #[test]
+    fn new_mr_with_my_requested_changes_is_read_auto() {
+        // act
+        let r = decide_with_rc(None, T1, &[], false, true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn auto_state_unchanged_mr_with_my_requested_changes_marks_read() {
+        // arrange
+        let stored = full(true, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_my_requested_changes_and_others_activity_marks_unread() {
+        // arrange — key fix-cycle case: I asked for changes, author pushed/replied
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let other = note("alice", T2);
+
+        // act
+        let r = decide_with_rc(Some(&stored), T2, std::slice::from_ref(&other), false, true);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn auto_state_changed_mr_with_my_requested_changes_and_only_my_activity_marks_read() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide_with_rc(Some(&stored), T2, &[note(ME, T2)], false, true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn approval_takes_precedence_over_requested_changes() {
+        // act
+        let r = decide_with_rc(None, T1, &[], true, true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_unchanged_mr_with_my_requested_changes_respects_pin() {
+        // arrange
+        let stored = full(true, T1, ReadStateSource::User);
+
+        // act
+        let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn legacy_bool_with_my_requested_changes_marks_read() {
+        // arrange
+        let stored = StoredReadState::LegacyBool(true);
+
+        // act
+        let r = decide_with_rc(Some(&stored), T1, &[], false, true);
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- decide_unread_status: pending re-request review ---
+
+    #[test]
+    fn review_request_pending_marks_unread() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(1));
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn review_request_overrides_active_approval() {
+        // arrange
+        let stored = full(false, T1, ReadStateSource::Auto);
+
+        // act
+        let r = decide_with_review_request(Some(&stored), T1, true, Some(1));
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_unchanged_mr_with_same_review_request_respects_pin() {
+        // arrange — user read the MR while this re-request todo was already pending:
+        // the todo id matches the pin anchor, so the pin holds
+        let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
+
+        // act
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(7));
+
+        // assert
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn user_pin_broken_by_new_review_request() {
+        // arrange — user read the MR with no re-request pending, then a re-request
+        // arrives: a fresh todo id breaks the pin and marks the MR unread
+        let stored = full_todo(false, T1, ReadStateSource::User, None);
+
+        // act
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(9));
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_broken_by_changed_review_request_todo() {
+        // arrange — user read the MR during one re-request, then the author
+        // re-requests again (new todo id) without touching updated_at
+        let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
+
+        // act
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(9));
+
+        // assert
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    // --- me_requested_changes helper ---
+
+    #[test]
+    fn me_requested_changes_returns_true_when_my_state_is_requested_changes() {
+        // arrange
+        let reviewers = vec![
+            reviewer(2, Some("approved")),
+            reviewer(1, Some("requested_changes")),
+        ];
+
+        // act / assert
+        assert!(me_requested_changes(&reviewers, 1));
+    }
+
+    #[test]
+    fn me_requested_changes_returns_false_for_other_states() {
+        for state in ["unreviewed", "reviewed", "approved"] {
+            // arrange
+            let reviewers = vec![reviewer(1, Some(state))];
+
+            // act / assert
+            assert!(!me_requested_changes(&reviewers, 1));
+        }
+    }
+
+    #[test]
+    fn me_requested_changes_returns_false_when_state_missing() {
+        // arrange
+        let reviewers = vec![reviewer(1, None)];
+
+        // act / assert
+        assert!(!me_requested_changes(&reviewers, 1));
+    }
+
+    #[test]
+    fn me_requested_changes_ignores_other_reviewers_state() {
+        // arrange
+        let reviewers = vec![reviewer(2, Some("requested_changes"))];
+
+        // act / assert
+        assert!(!me_requested_changes(&reviewers, 1));
+    }
+
+    #[test]
+    fn me_requested_changes_returns_false_for_empty_reviewers() {
+        // act / assert
+        assert!(!me_requested_changes(&[], 1));
+    }
+
+    #[test]
+    fn reviewer_states_deserialize_from_real_gitlab_response() {
+        // arrange
+        let body = serde_json::json!([
+            {
+                "user": {
+                    "id": 1,
+                    "name": "John Doe",
+                    "username": "jdoe",
+                    "state": "active",
+                    "avatar_url": "https://example.com/avatar.png",
+                    "web_url": "https://gitlab.example.com/jdoe"
+                },
+                "state": "requested_changes",
+                "created_at": "2020-10-06T12:34:56.000Z"
+            },
+            {
+                "user": {
+                    "id": 2,
+                    "name": "Jane Roe",
+                    "username": "jroe",
+                    "state": "active",
+                    "avatar_url": "",
+                    "web_url": "https://gitlab.example.com/jroe"
+                },
+                "state": "unreviewed",
+                "created_at": "2020-10-06T12:34:56.000Z"
+            }
+        ]);
+
+        // act
+        let reviewers: Vec<GitLabReviewerState> = serde_json::from_value(body).unwrap();
+
+        // assert
+        assert!(me_requested_changes(&reviewers, 1));
+        assert!(!me_requested_changes(&reviewers, 2));
+    }
+
+    #[test]
+    fn todos_deserialize_from_real_gitlab_response() {
+        // arrange
+        let body = serde_json::json!([
+            {
+                "id": 719314370,
+                "action_name": "review_requested",
+                "target_type": "MergeRequest",
+                "target": { "id": 500732801, "iid": 1, "title": "wip" },
+                "author": {
+                    "id": 2,
+                    "name": "temp temp",
+                    "username": "temp925",
+                    "state": "active",
+                    "avatar_url": ""
+                },
+                "state": "pending"
+            }
+        ]);
+
+        // act
+        let todos: Vec<GitLabTodo> = serde_json::from_value(body).unwrap();
+
+        // assert
+        assert_eq!(todos.len(), 1);
+        let todo = &todos[0];
+        assert_eq!(todo.id, 719314370);
+        assert_eq!(todo.action_name, "review_requested");
+        assert_eq!(todo.target_type, "MergeRequest");
+        assert_eq!(todo.target.id, 500732801);
+        assert_eq!(todo.author.name, "temp temp");
+    }
+
+    // --- notes_to_activity ---
+
+    #[test]
+    fn notes_to_activity_starts_with_synthetic_opened_event() {
+        // arrange
+        let mr = gl_mr();
+
+        // act
+        let events = notes_to_activity(&[], &mr);
+
+        // assert
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].who, mr.author.username);
+        assert_eq!(events[0].time, mr.updated_at);
+        assert!(events[0].text.contains("opened"));
+    }
+
+    #[test]
+    fn notes_to_activity_keeps_newest_20_notes_in_chronological_order() {
+        // arrange — 25 notes, API order is newest-first (sort=desc)
+        let notes: Vec<GitLabNote> = (0..25)
+            .map(|i| note("alice", &format!("2026-03-{:02}T10:00:00Z", 25 - i)))
+            .collect();
+        let mr = gl_mr();
+
+        // act
+        let events = notes_to_activity(&notes, &mr);
+
+        // assert — opened event plus the 20 newest notes, oldest-kept first
+        let note_times: Vec<String> = events[1..].iter().map(|e| e.time.clone()).collect();
+        let expected: Vec<String> = (6..=25)
+            .map(|d| format!("2026-03-{:02}T10:00:00Z", d))
+            .collect();
+        assert_eq!(note_times, expected);
+    }
+
+    // --- ReadStateSource round-trip ---
+
+    #[test]
+    fn read_state_source_roundtrip() {
+        for src in [ReadStateSource::User, ReadStateSource::Auto] {
+            // act / assert
+            assert_eq!(ReadStateSource::from_stored(src.as_str()), src);
+        }
+    }
 }

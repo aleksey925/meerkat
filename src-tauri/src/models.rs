@@ -61,6 +61,17 @@ pub struct MergeRequest {
     pub unread: bool,
     pub reminder: Option<String>,
     pub activity: Vec<ActivityEvent>,
+    #[serde(skip)]
+    pub latest_actor: Option<String>,
+    // raw GitLab updated_at string, used as anchor for read-state comparisons
+    #[serde(skip)]
+    pub updated_at_raw: String,
+    // id of the pending "review requested" todo, used to detect a fresh
+    // re-request between polls (re-request doesn't move updated_at)
+    #[serde(skip)]
+    pub review_request_todo_id: Option<i64>,
+    #[serde(skip)]
+    pub review_request_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +147,26 @@ pub struct GitLabUser {
 pub struct GitLabPipeline {
     pub id: i64,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabReviewerState {
+    pub user: GitLabUser,
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabTodo {
+    pub id: i64,
+    pub action_name: String,
+    pub target_type: String,
+    pub target: GitLabTodoTarget,
+    pub author: GitLabUser,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabTodoTarget {
+    pub id: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

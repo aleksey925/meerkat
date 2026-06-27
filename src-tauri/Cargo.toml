@@ -2,11 +2,12 @@
 name = "meerkat"
 version = "0.0.0"
 description = "Meerkat - Desktop notification app for tracking GitLab merge requests"
-authors = ["you"]
-license = ""
-repository = ""
+authors = ["Aleksey Petrunnik"]
+license = "MIT"
+repository = "https://github.com/aleksey925/meerkat"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.95.0"
+publish = false
 
 [lib]
 name = "app_lib"
@@ -34,3 +35,9 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"], default-features = false }
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
