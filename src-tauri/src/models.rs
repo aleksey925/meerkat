@@ -145,13 +145,8 @@ pub struct GitLabPipeline {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabReviewerState {
-    pub id: i64,
+    pub user: GitLabUser,
     pub state: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct GitLabMrDetail {
-    pub reviewers: Option<Vec<GitLabReviewerState>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

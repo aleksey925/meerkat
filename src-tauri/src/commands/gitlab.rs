@@ -271,32 +271,54 @@ async fn fetch_reviewer_states(
     project_id: i64,
     mr_iid: i64,
 ) -> Vec<GitLabReviewerState> {
-    let url = format!(
-        "{}/api/v4/projects/{}/merge_requests/{}",
-        base_url, project_id, mr_iid
-    );
+    let mut all = Vec::new();
+    let mut page = 1u32;
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
+    loop {
+        let url = format!(
+            "{}/api/v4/projects/{}/merge_requests/{}/reviewers?per_page=100&page={}",
+            base_url, project_id, mr_iid, page
+        );
 
-    if !resp.status().is_success() {
-        return Vec::new();
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if !resp.status().is_success() {
+            break;
+        }
+
+        let next_page = resp
+            .headers()
+            .get("x-next-page")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+
+        let reviewers: Vec<GitLabReviewerState> = match resp.json().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if reviewers.is_empty() {
+            break;
+        }
+
+        all.extend(reviewers);
+
+        match next_page {
+            Some(np) if np > page => page = np,
+            _ => break,
+        }
     }
 
-    let detail: GitLabMrDetail = match resp.json().await {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-
-    detail.reviewers.unwrap_or_default()
+    all
 }
 
 fn me_requested_changes(reviewers: &[GitLabReviewerState], current_uid: i64) -> bool {
     reviewers
         .iter()
-        .any(|r| r.id == current_uid && r.state.as_deref() == Some("requested_changes"))
+        .any(|r| r.user.id == current_uid && r.state.as_deref() == Some("requested_changes"))
 }
 
 async fn fetch_notes(
@@ -851,7 +873,12 @@ mod tests {
 
     fn reviewer(uid: i64, state: Option<&str>) -> GitLabReviewerState {
         GitLabReviewerState {
-            id: uid,
+            user: GitLabUser {
+                id: uid,
+                username: format!("user{}", uid),
+                name: format!("User {}", uid),
+                avatar_url: String::new(),
+            },
             state: state.map(String::from),
         }
     }
@@ -1188,6 +1215,44 @@ mod tests {
     #[test]
     fn me_requested_changes_returns_false_for_empty_reviewers() {
         assert!(!me_requested_changes(&[], 1));
+    }
+
+    #[test]
+    fn reviewer_states_deserialize_from_real_gitlab_response() {
+        // arrange
+        let body = serde_json::json!([
+            {
+                "user": {
+                    "id": 1,
+                    "name": "John Doe",
+                    "username": "jdoe",
+                    "state": "active",
+                    "avatar_url": "https://example.com/avatar.png",
+                    "web_url": "https://gitlab.example.com/jdoe"
+                },
+                "state": "requested_changes",
+                "created_at": "2020-10-06T12:34:56.000Z"
+            },
+            {
+                "user": {
+                    "id": 2,
+                    "name": "Jane Roe",
+                    "username": "jroe",
+                    "state": "active",
+                    "avatar_url": "",
+                    "web_url": "https://gitlab.example.com/jroe"
+                },
+                "state": "unreviewed",
+                "created_at": "2020-10-06T12:34:56.000Z"
+            }
+        ]);
+
+        // act
+        let reviewers: Vec<GitLabReviewerState> = serde_json::from_value(body).unwrap();
+
+        // assert
+        assert!(me_requested_changes(&reviewers, 1));
+        assert!(!me_requested_changes(&reviewers, 2));
     }
 
     // --- ReadStateSource round-trip ---
