@@ -136,6 +136,14 @@ pub fn notify_mr_updated(app: &AppHandle, author: &str, title: &str) {
     );
 }
 
+pub fn notify_review_requested(app: &AppHandle, author: &str, title: &str) {
+    send_notification(
+        app,
+        "Review requested",
+        &format!("{} requested your review on '{}'", author, title),
+    );
+}
+
 pub fn notify_pipeline_failed(app: &AppHandle, title: &str) {
     send_notification(app, "Pipeline failed", &format!("CI failed on '{}'", title));
 }

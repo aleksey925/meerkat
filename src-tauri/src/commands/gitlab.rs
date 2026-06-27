@@ -321,6 +321,72 @@ fn me_requested_changes(reviewers: &[GitLabReviewerState], current_uid: i64) -> 
         .any(|r| r.user.id == current_uid && r.state.as_deref() == Some("requested_changes"))
 }
 
+struct ReviewRequest {
+    todo_id: i64,
+    by: String,
+}
+
+// pending "review requested" todos keyed by MR global id. a re-request doesn't
+// move the MR's updated_at and leaves no note we can attribute, so the todo is
+// the only reliable signal that the author asked me to review again.
+async fn fetch_review_request_todos(
+    client: &Client,
+    base_url: &str,
+) -> HashMap<i64, ReviewRequest> {
+    let mut map = HashMap::new();
+    let mut page = 1u32;
+
+    loop {
+        let url = format!(
+            "{}/api/v4/todos?state=pending&action=review_requested&per_page=100&page={}",
+            base_url, page
+        );
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if !resp.status().is_success() {
+            break;
+        }
+
+        let next_page = resp
+            .headers()
+            .get("x-next-page")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+
+        let todos: Vec<GitLabTodo> = match resp.json().await {
+            Ok(t) => t,
+            Err(_) => break,
+        };
+
+        if todos.is_empty() {
+            break;
+        }
+
+        for todo in todos {
+            if todo.target_type == "MergeRequest" && todo.action_name == "review_requested" {
+                map.insert(
+                    todo.target.id,
+                    ReviewRequest {
+                        todo_id: todo.id,
+                        by: todo.author.name,
+                    },
+                );
+            }
+        }
+
+        match next_page {
+            Some(np) if np > page => page = np,
+            _ => break,
+        }
+    }
+
+    map
+}
+
 async fn fetch_notes(
     client: &Client,
     base_url: &str,
@@ -442,14 +508,39 @@ fn find_latest_activity_from_others(
     current_username: &str,
     since: &str,
 ) -> Option<String> {
-    // notes are sorted desc (newest first)
+    // notes are sorted desc (newest first). only the single most recent note
+    // counts: if my own comment is the latest activity, there is nothing to
+    // attribute to others. skipping my note to surface an older one would let
+    // my own comment fire a notification naming whoever spoke before me.
+    let note = notes.first()?;
+    if note.created_at.as_str() <= since || note.author.username == current_username {
+        return None;
+    }
+    Some(note.author.name.clone())
+}
+
+// newest human comment from someone else, but only if it is newer than my own
+// most recent action (comment, approval, review). used to wake an approved MR:
+// a real message should reach me, while my own approval and automated system
+// notes (CI, pushes, label changes) must not.
+fn find_latest_comment_from_others(
+    notes: &[GitLabNote],
+    current_username: &str,
+    since: &str,
+) -> Option<String> {
     for note in notes {
         if note.created_at.as_str() <= since {
             break;
         }
-        if note.author.username != current_username {
+        if note.author.username == current_username {
+            // I acted more recently than any other comment here — up to date
+            return None;
+        }
+        if !note.system.unwrap_or(false) {
             return Some(note.author.name.clone());
         }
+        // a system note from someone else (push, label) — not a comment, keep
+        // scanning older notes for an actual message
     }
     None
 }
@@ -480,6 +571,13 @@ struct ReadStatus {
     unread: bool,
     latest_actor: Option<String>,
     source: ReadStateSource,
+}
+
+#[derive(Clone, Copy)]
+struct ReadSignals {
+    approved_by_me: bool,
+    i_requested_changes: bool,
+    review_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -522,8 +620,7 @@ fn decide_unread_status(
     updated_at: &str,
     notes: &[GitLabNote],
     current_username: &str,
-    approved_by_me: bool,
-    i_requested_changes: bool,
+    signals: ReadSignals,
 ) -> ReadStatus {
     let (stored_unread, stored_updated, stored_source) = match stored {
         Some(StoredReadState::Full {
@@ -548,9 +645,37 @@ fn decide_unread_status(
         }
     }
 
-    // 2. active approval from me — auto-read (GitLab resets approval on push,
-    // so the next "real" activity will fall through to step 3 naturally)
-    if approved_by_me {
+    // 2. a re-request review is pending for me — unread. sits above approval
+    // because a re-request means the author wants another look even if a stale
+    // approval is still on record. notification is driven separately by the
+    // todo id (re-request leaves no note and doesn't move updated_at).
+    if signals.review_requested {
+        return ReadStatus {
+            unread: true,
+            latest_actor: None,
+            source: ReadStateSource::Auto,
+        };
+    }
+
+    // 3. someone else left a real comment since I last looked — unread + notify,
+    // even if I have approved. approval should silence CI/push noise, not a human
+    // message; pushes are handled below because GitLab resets my approval on push.
+    if let Some(stored_ts) = stored_updated {
+        if stored_ts != updated_at {
+            if let Some(actor) = find_latest_comment_from_others(notes, current_username, stored_ts)
+            {
+                return ReadStatus {
+                    unread: true,
+                    latest_actor: Some(actor),
+                    source: ReadStateSource::Auto,
+                };
+            }
+        }
+    }
+
+    // 4. active approval from me — auto-read (GitLab resets approval on push,
+    // so the next "real" activity will fall through to step 5 naturally)
+    if signals.approved_by_me {
         return ReadStatus {
             unread: false,
             latest_actor: None,
@@ -558,7 +683,7 @@ fn decide_unread_status(
         };
     }
 
-    // 3. MR changed since last fetch and someone else acted — auto-unread
+    // 5. MR changed since last fetch and someone else acted — auto-unread
     if let Some(stored_ts) = stored_updated {
         if stored_ts != updated_at {
             let latest_actor = find_latest_activity_from_others(notes, current_username, stored_ts);
@@ -572,10 +697,10 @@ fn decide_unread_status(
         }
     }
 
-    // 4. I left a "request changes" review — auto-read. Sits below activity-from-others
+    // 6. I left a "request changes" review — auto-read. Sits below activity-from-others
     // so any reaction from the author (push, comment) flips it back to unread for the
     // next round of the fix cycle.
-    if i_requested_changes {
+    if signals.i_requested_changes {
         return ReadStatus {
             unread: false,
             latest_actor: None,
@@ -583,7 +708,7 @@ fn decide_unread_status(
         };
     }
 
-    // 5. fallback — keep stored, default to unread for new MRs
+    // 7. fallback — keep stored, default to unread for new MRs
     ReadStatus {
         unread: stored_unread.unwrap_or(true),
         latest_actor: None,
@@ -597,8 +722,7 @@ fn resolve_unread_status(
     updated_at: &str,
     notes: &[GitLabNote],
     current_username: &str,
-    approved_by_me: bool,
-    i_requested_changes: bool,
+    signals: ReadSignals,
 ) -> ReadStatus {
     let read_store = app.store("mr_read_state.json").ok();
     let key = mr_id.to_string();
@@ -612,8 +736,7 @@ fn resolve_unread_status(
         updated_at,
         notes,
         current_username,
-        approved_by_me,
-        i_requested_changes,
+        signals,
     )
 }
 
@@ -732,10 +855,13 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         .collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
+    let review_request_todos = fetch_review_request_todos(&client, &base_url).await;
+
     // Build MRs with details
     let mut active = Vec::new();
 
     for gl_mr in &all_gitlab_mrs {
+        let review_request = review_request_todos.get(&gl_mr.id);
         let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
         let approval_info =
             fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
@@ -759,8 +885,11 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             &gl_mr.updated_at,
             &notes,
             &username,
-            approval_info.approved_by_me,
-            requested_changes,
+            ReadSignals {
+                approved_by_me: approval_info.approved_by_me,
+                i_requested_changes: requested_changes,
+                review_requested: review_request.is_some(),
+            },
         );
         let reminder = resolve_reminder(&app, gl_mr.id);
 
@@ -801,6 +930,8 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             activity,
             latest_actor: read_status.latest_actor,
             updated_at_raw: gl_mr.updated_at.clone(),
+            review_request_todo_id: review_request.map(|r| r.todo_id),
+            review_request_by: review_request.map(|r| r.by.clone()),
         };
 
         active.push(mr);
@@ -837,6 +968,13 @@ mod tests {
         }
     }
 
+    fn system_note(username: &str, created_at: &str) -> GitLabNote {
+        GitLabNote {
+            system: Some(true),
+            ..note(username, created_at)
+        }
+    }
+
     fn full(unread: bool, updated_at: &str, source: ReadStateSource) -> StoredReadState {
         StoredReadState::Full {
             unread,
@@ -851,7 +989,17 @@ mod tests {
         notes: &[GitLabNote],
         approved_by_me: bool,
     ) -> ReadStatus {
-        decide_unread_status(stored, updated_at, notes, ME, approved_by_me, false)
+        decide_unread_status(
+            stored,
+            updated_at,
+            notes,
+            ME,
+            ReadSignals {
+                approved_by_me,
+                i_requested_changes: false,
+                review_requested: false,
+            },
+        )
     }
 
     fn decide_with_rc(
@@ -866,8 +1014,29 @@ mod tests {
             updated_at,
             notes,
             ME,
-            approved_by_me,
-            i_requested_changes,
+            ReadSignals {
+                approved_by_me,
+                i_requested_changes,
+                review_requested: false,
+            },
+        )
+    }
+
+    fn decide_with_review_request(
+        stored: Option<&StoredReadState>,
+        updated_at: &str,
+        approved_by_me: bool,
+    ) -> ReadStatus {
+        decide_unread_status(
+            stored,
+            updated_at,
+            &[],
+            ME,
+            ReadSignals {
+                approved_by_me,
+                i_requested_changes: false,
+                review_requested: true,
+            },
         )
     }
 
@@ -897,12 +1066,11 @@ mod tests {
     }
 
     #[test]
-    fn find_latest_activity_from_others_returns_other_skipping_my_newer_note() {
-        // notes are sorted desc (newest first), as GitLab returns them
-        let other = note("alice", T2);
-        let notes = vec![note(ME, T3), other.clone()];
-        let actor = find_latest_activity_from_others(&notes, ME, T1);
-        assert_eq!(actor, Some(other.author.name));
+    fn find_latest_activity_from_others_returns_none_when_my_note_is_newest() {
+        // my own comment is the latest activity: nothing to attribute to others,
+        // otherwise my comment would notify me naming whoever spoke before me
+        let notes = vec![note(ME, T3), note("alice", T2)];
+        assert!(find_latest_activity_from_others(&notes, ME, T1).is_none());
     }
 
     #[test]
@@ -919,6 +1087,43 @@ mod tests {
         let notes = vec![newest_other.clone(), older_other];
         let actor = find_latest_activity_from_others(&notes, ME, T1);
         assert_eq!(actor, Some(newest_other.author.name));
+    }
+
+    // --- find_latest_comment_from_others ---
+
+    #[test]
+    fn find_latest_comment_returns_human_comment_from_others() {
+        let other = note("alice", T2);
+        let actor = find_latest_comment_from_others(std::slice::from_ref(&other), ME, T1);
+        assert_eq!(actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn find_latest_comment_skips_others_system_note_for_older_comment() {
+        // a push (system) on top of a real comment still surfaces the comment
+        let comment = note("alice", T2);
+        let notes = vec![system_note("alice", T3), comment.clone()];
+        let actor = find_latest_comment_from_others(&notes, ME, T1);
+        assert_eq!(actor, Some(comment.author.name));
+    }
+
+    #[test]
+    fn find_latest_comment_returns_none_when_only_others_system_notes() {
+        let notes = vec![system_note("alice", T3)];
+        assert!(find_latest_comment_from_others(&notes, ME, T1).is_none());
+    }
+
+    #[test]
+    fn find_latest_comment_returns_none_when_my_action_is_newest() {
+        // my approval (system, mine) on top of others' comment — I'm up to date
+        let notes = vec![system_note(ME, T3), note("alice", T2)];
+        assert!(find_latest_comment_from_others(&notes, ME, T1).is_none());
+    }
+
+    #[test]
+    fn find_latest_comment_returns_none_at_or_before_since() {
+        let notes = vec![note("alice", T1)];
+        assert!(find_latest_comment_from_others(&notes, ME, T1).is_none());
     }
 
     // --- parse_stored_read_state ---
@@ -1056,12 +1261,44 @@ mod tests {
     }
 
     #[test]
-    fn auto_state_changed_mr_with_approval_marks_read_ignoring_others_activity() {
-        // active approval beats activity-from-others rule (matches user's spec)
+    fn approval_keeps_read_when_only_system_notes_follow() {
+        // approval silences CI/push noise: a system note from another must not
+        // resurface the MR
         let stored = full(false, T1, ReadStateSource::Auto);
-        let r = decide(Some(&stored), T2, &[note("alice", T2)], true);
+        let r = decide(Some(&stored), T2, &[system_note("alice", T2)], true);
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn approval_does_not_silence_human_comment_from_others() {
+        // a real comment must reach me even after I approved (matches user's spec)
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let other = note("alice", T2);
+        let r = decide(Some(&stored), T2, std::slice::from_ref(&other), true);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+        assert_eq!(r.latest_actor, Some(other.author.name));
+    }
+
+    #[test]
+    fn approval_then_my_own_comment_stays_read() {
+        // approving and then commenting myself: I'm up to date, no resurface
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let notes = [note(ME, T3), system_note(ME, T2)];
+        let r = decide(Some(&stored), T3, &notes, true);
+        assert!(!r.unread);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn approval_with_others_comment_before_my_action_stays_read() {
+        // others commented, then I approved on top — I've seen it, stay read
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let notes = [system_note(ME, T3), note("alice", T2)];
+        let r = decide(Some(&stored), T3, &notes, true);
+        assert!(!r.unread);
         assert!(r.latest_actor.is_none());
     }
 
@@ -1083,6 +1320,16 @@ mod tests {
         let r = decide(Some(&stored), T2, &[note(ME, T2)], false);
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
+        assert!(r.latest_actor.is_none());
+    }
+
+    #[test]
+    fn my_comment_after_others_note_does_not_set_actor() {
+        // user pinned unread, then commented themselves: must stay unread but
+        // expose no actor, so polling won't fire a notification for my own comment
+        let stored = full(true, T1, ReadStateSource::User);
+        let r = decide(Some(&stored), T3, &[note(ME, T3), note("alice", T2)], false);
+        assert!(r.unread);
         assert!(r.latest_actor.is_none());
     }
 
@@ -1181,6 +1428,32 @@ mod tests {
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
+    // --- decide_unread_status: pending re-request review ---
+
+    #[test]
+    fn review_request_pending_marks_unread() {
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let r = decide_with_review_request(Some(&stored), T1, false);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn review_request_overrides_active_approval() {
+        let stored = full(false, T1, ReadStateSource::Auto);
+        let r = decide_with_review_request(Some(&stored), T1, true);
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_unchanged_mr_with_review_request_respects_pin() {
+        let stored = full(false, T1, ReadStateSource::User);
+        let r = decide_with_review_request(Some(&stored), T1, false);
+        assert!(!r.unread);
+        assert_eq!(r.source, ReadStateSource::User);
+    }
+
     // --- me_requested_changes helper ---
 
     #[test]
@@ -1253,6 +1526,39 @@ mod tests {
         // assert
         assert!(me_requested_changes(&reviewers, 1));
         assert!(!me_requested_changes(&reviewers, 2));
+    }
+
+    #[test]
+    fn todos_deserialize_from_real_gitlab_response() {
+        // arrange
+        let body = serde_json::json!([
+            {
+                "id": 719314370,
+                "action_name": "review_requested",
+                "target_type": "MergeRequest",
+                "target": { "id": 500732801, "iid": 1, "title": "wip" },
+                "author": {
+                    "id": 2,
+                    "name": "temp temp",
+                    "username": "temp925",
+                    "state": "active",
+                    "avatar_url": ""
+                },
+                "state": "pending"
+            }
+        ]);
+
+        // act
+        let todos: Vec<GitLabTodo> = serde_json::from_value(body).unwrap();
+
+        // assert
+        assert_eq!(todos.len(), 1);
+        let todo = &todos[0];
+        assert_eq!(todo.id, 719314370);
+        assert_eq!(todo.action_name, "review_requested");
+        assert_eq!(todo.target_type, "MergeRequest");
+        assert_eq!(todo.target.id, 500732801);
+        assert_eq!(todo.author.name, "temp temp");
     }
 
     // --- ReadStateSource round-trip ---

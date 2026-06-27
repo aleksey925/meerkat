@@ -39,6 +39,12 @@ fn detect_changes_and_notify(
                         notifications::notify_mr_updated(app, actor, &mr.title);
                     }
                 }
+                if mr.review_request_todo_id.is_some()
+                    && mr.review_request_todo_id != prev_mr.review_request_todo_id
+                {
+                    let who = mr.review_request_by.as_deref().unwrap_or(&mr.author_name);
+                    notifications::notify_review_requested(app, who, &mr.title);
+                }
                 if mr.pipeline_status == Some(PipelineStatus::Fail)
                     && prev_mr.pipeline_status != Some(PipelineStatus::Fail)
                 {
