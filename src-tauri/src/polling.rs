@@ -21,6 +21,25 @@ pub(crate) fn previous_mr_updated_at_raw(mr_id: i64) -> Option<String> {
         .map(|m| m.updated_at_raw.clone())
 }
 
+pub(crate) fn previous_mr_pipeline_status(mr_id: i64) -> Option<PipelineStatus> {
+    let prev = PREVIOUS_MRS.lock().ok()?;
+    let mrs = prev.as_ref()?;
+    mrs.iter()
+        .find(|m| m.id == mr_id)
+        .and_then(|m| m.pipeline_status.clone())
+}
+
+// previous (todo_id, requested_by) for an MR, used to carry the re-request
+// forward when the todos fetch fails so a transient outage neither drops the
+// re-request nor re-fires its notification on recovery
+pub(crate) fn previous_mr_review_request(mr_id: i64) -> Option<(i64, String)> {
+    let prev = PREVIOUS_MRS.lock().ok()?;
+    let mrs = prev.as_ref()?;
+    let mr = mrs.iter().find(|m| m.id == mr_id)?;
+    let todo_id = mr.review_request_todo_id?;
+    Some((todo_id, mr.review_request_by.clone().unwrap_or_default()))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum NotifyAction {
     NewMr {

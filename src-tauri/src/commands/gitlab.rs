@@ -5,6 +5,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
+use tokio::time::{sleep, Duration};
 
 fn build_client(token: &str) -> Result<Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -15,8 +16,47 @@ fn build_client(token: &str) -> Result<Client, String> {
     );
     Client::builder()
         .default_headers(headers)
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+// statuses that signal a momentary server/proxy hiccup rather than a real
+// failure - safe to retry the same GET
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+// GET with one retry on transient failures (network errors and 408/429/5xx). a
+// single blip would otherwise fail the whole poll and drop the app to offline; a
+// short backoff lets a flaky request recover within the cycle. kept low on
+// purpose - a persistently slow endpoint that 408s should fail fast and let the
+// caller degrade, not stack up multi-minute hangs.
+async fn gitlab_get(client: &Client, url: &str) -> Result<reqwest::Response, String> {
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut attempt = 1;
+    loop {
+        let outcome = client.get(url).send().await;
+        match &outcome {
+            Ok(resp) if is_transient_status(resp.status()) => {
+                log::warn!(
+                    "transient {} from {} (attempt {attempt})",
+                    resp.status(),
+                    url
+                )
+            }
+            Err(e) => log::warn!("request error from {} (attempt {attempt}): {e}", url),
+            _ => {}
+        }
+        match outcome {
+            Ok(resp) if is_transient_status(resp.status()) && attempt < MAX_ATTEMPTS => {}
+            Ok(resp) => return Ok(resp),
+            Err(e) if attempt >= MAX_ATTEMPTS => return Err(format!("API error: {e}")),
+            Err(_) => {}
+        }
+        sleep(Duration::from_millis(500 * attempt as u64)).await;
+        attempt += 1;
+    }
 }
 
 fn get_credentials(app: &AppHandle) -> Result<(String, String), String> {
@@ -102,11 +142,7 @@ async fn fetch_mrs_by_scope(
             base_url, param, uid, page
         );
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("API error: {e}"))?;
+        let resp = gitlab_get(client, &url).await?;
 
         if !resp.status().is_success() {
             if resp.status() == 401 {
@@ -138,79 +174,34 @@ async fn fetch_mrs_by_scope(
     Ok(all)
 }
 
-async fn fetch_mentioned_mrs(
-    client: &Client,
-    base_url: &str,
-    username: &str,
-    uid: i64,
-) -> Result<Vec<GitLabMr>, String> {
-    let mut all = Vec::new();
-    let mut page = 1u32;
-
-    loop {
-        let url = format!(
-            "{}/api/v4/merge_requests?scope=all&state=opened&per_page=100&page={}&search=@{}",
-            base_url, page, username
-        );
-
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("API error: {e}"))?;
-
-        if !resp.status().is_success() {
-            break;
-        }
-
-        let next_page = resp
-            .headers()
-            .get("x-next-page")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u32>().ok());
-
-        let mrs: Vec<GitLabMr> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
-
-        if mrs.is_empty() {
-            break;
-        }
-
-        // only keep MRs not authored by the user
-        for mr in mrs {
-            if mr.author.id != uid {
-                all.push(mr);
-            }
-        }
-
-        match next_page {
-            Some(np) if np > page => page = np,
-            _ => break,
-        }
-    }
-
-    Ok(all)
-}
-
+// Err distinguishes a failed fetch from Ok(None) "no pipeline". the caller
+// carries forward the previous status on Err: collapsing a transient failure to
+// None would make an already-failing pipeline read Fail -> None -> Fail across
+// polls and fire a duplicate pipeline-failed notification on recovery.
 async fn fetch_pipeline_status(
     client: &Client,
     base_url: &str,
     project_id: i64,
     mr_iid: i64,
-) -> Option<PipelineStatus> {
+) -> Result<Option<PipelineStatus>, String> {
     let url = format!(
         "{}/api/v4/projects/{}/merge_requests/{}/pipelines?per_page=1",
         base_url, project_id, mr_iid
     );
 
-    let resp = client.get(&url).send().await.ok()?;
-    let pipelines: Vec<GitLabPipeline> = resp.json().await.ok()?;
+    let resp = gitlab_get(client, &url).await?;
+    if !resp.status().is_success() {
+        return Err(format!("GitLab API error: {}", resp.status()));
+    }
+    let pipelines: Vec<GitLabPipeline> =
+        resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
-    pipelines.first().map(|p| match p.status.as_str() {
+    Ok(pipelines.first().map(|p| match p.status.as_str() {
         "success" => PipelineStatus::Pass,
         "failed" => PipelineStatus::Fail,
         "running" => PipelineStatus::Running,
         _ => PipelineStatus::Pending,
-    })
+    }))
 }
 
 struct ApprovalInfo {
@@ -231,7 +222,7 @@ async fn fetch_approvals(
         base_url, project_id, mr_iid
     );
 
-    let resp = match client.get(&url).send().await {
+    let resp = match gitlab_get(client, &url).await {
         Ok(r) => r,
         Err(_) => {
             return ApprovalInfo {
@@ -280,7 +271,7 @@ async fn fetch_reviewer_states(
             base_url, project_id, mr_iid, page
         );
 
-        let resp = match client.get(&url).send().await {
+        let resp = match gitlab_get(client, &url).await {
             Ok(r) => r,
             Err(_) => break,
         };
@@ -321,6 +312,7 @@ fn me_requested_changes(reviewers: &[GitLabReviewerState], current_uid: i64) -> 
         .any(|r| r.user.id == current_uid && r.state.as_deref() == Some("requested_changes"))
 }
 
+#[derive(Clone)]
 struct ReviewRequest {
     todo_id: i64,
     by: String,
@@ -332,7 +324,7 @@ struct ReviewRequest {
 async fn fetch_review_request_todos(
     client: &Client,
     base_url: &str,
-) -> HashMap<i64, ReviewRequest> {
+) -> Result<HashMap<i64, ReviewRequest>, String> {
     let mut map = HashMap::new();
     let mut page = 1u32;
 
@@ -342,13 +334,16 @@ async fn fetch_review_request_todos(
             base_url, page
         );
 
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => break,
-        };
+        let resp = gitlab_get(client, &url).await?;
 
         if !resp.status().is_success() {
-            break;
+            if resp.status() == 401 {
+                return Err("TOKEN_EXPIRED".to_string());
+            }
+            // distinguish a failed fetch from "no pending todos": on an empty map
+            // a still-pending re-request would flip the MR read and then re-notify
+            // once the endpoint recovers, so fail the cycle instead
+            return Err(format!("GitLab API error: {}", resp.status()));
         }
 
         let next_page = resp
@@ -357,10 +352,7 @@ async fn fetch_review_request_todos(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
 
-        let todos: Vec<GitLabTodo> = match resp.json().await {
-            Ok(t) => t,
-            Err(_) => break,
-        };
+        let todos: Vec<GitLabTodo> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         if todos.is_empty() {
             break;
@@ -384,7 +376,7 @@ async fn fetch_review_request_todos(
         }
     }
 
-    map
+    Ok(map)
 }
 
 async fn fetch_notes(
@@ -392,18 +384,17 @@ async fn fetch_notes(
     base_url: &str,
     project_id: i64,
     mr_iid: i64,
-) -> Vec<GitLabNote> {
+) -> Option<Vec<GitLabNote>> {
     let url = format!(
         "{}/api/v4/projects/{}/merge_requests/{}/notes?sort=desc&per_page=50",
         base_url, project_id, mr_iid
     );
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    resp.json().await.unwrap_or_default()
+    let resp = gitlab_get(client, &url).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
 }
 
 async fn fetch_project_info(
@@ -412,31 +403,25 @@ async fn fetch_project_info(
     project_id: i64,
 ) -> Option<GitLabProject> {
     let url = format!("{}/api/v4/projects/{}", base_url, project_id);
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = gitlab_get(client, &url).await.ok()?;
     resp.json().await.ok()
 }
 
-fn determine_role(mr: &GitLabMr, uid: i64, username: &str, notes: &[GitLabNote]) -> UserRole {
-    if mr
-        .reviewers
-        .as_ref()
-        .is_some_and(|r| r.iter().any(|u| u.id == uid))
-    {
-        return UserRole::Reviewer;
-    }
+fn determine_role(mr: &GitLabMr, uid: i64) -> UserRole {
     if mr
         .assignees
         .as_ref()
         .is_some_and(|a| a.iter().any(|u| u.id == uid))
+        && !mr
+            .reviewers
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|u| u.id == uid))
     {
         return UserRole::Assignee;
     }
-    let mention_tag = format!("@{}", username);
-    if notes.iter().any(|n| n.body.contains(&mention_tag)) {
-        return UserRole::Mentioned;
-    }
-    // came from reviewer/assignee query but user isn't listed — fallback
-    UserRole::Mentioned
+    // came from the reviewer or assignee scope query; default to reviewer when the
+    // listed reviewers/assignees don't include the user (incomplete list payload)
+    UserRole::Reviewer
 }
 
 fn determine_status(mr: &GitLabMr, approvals_current: u32, approvals_required: u32) -> MrStatus {
@@ -805,37 +790,20 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
 
-    let show_mentions = store
-        .get("show_mentions")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    // Fetch MRs by reviewer, assignee, and mentions in parallel
-    let (reviewer_mrs, assignee_mrs, mentioned_mrs) = tokio::join!(
+    // Fetch MRs by reviewer and assignee in parallel
+    let (reviewer_mrs, assignee_mrs) = tokio::join!(
         fetch_mrs_by_scope(&client, &base_url, "reviewer_id", uid),
         fetch_mrs_by_scope(&client, &base_url, "assignee_id", uid),
-        async {
-            if show_mentions && !username.is_empty() {
-                fetch_mentioned_mrs(&client, &base_url, &username, uid).await
-            } else {
-                Ok(Vec::new())
-            }
-        },
     );
 
     let reviewer_mrs = reviewer_mrs?;
     let assignee_mrs = assignee_mrs?;
-    let mentioned_mrs = mentioned_mrs.unwrap_or_default();
 
     // Deduplicate
     let mut seen = HashSet::new();
     let mut all_gitlab_mrs = Vec::new();
 
-    for mr in reviewer_mrs
-        .into_iter()
-        .chain(assignee_mrs)
-        .chain(mentioned_mrs)
-    {
+    for mr in reviewer_mrs.into_iter().chain(assignee_mrs) {
         if seen.insert(mr.id) {
             all_gitlab_mrs.push(mr);
         }
@@ -870,21 +838,36 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         .collect();
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // a failed todos fetch must not take the whole app offline: re-request
+    // detection is best-effort. on failure carry each MR's previous re-request
+    // forward so a transient outage neither drops it nor re-fires the
+    // notification once the endpoint recovers
     let review_request_todos = fetch_review_request_todos(&client, &base_url).await;
+    let todos_ok = review_request_todos.is_ok();
+    let review_request_todos = review_request_todos.unwrap_or_default();
 
     // Build MRs with details
     let mut active = Vec::new();
 
     for gl_mr in &all_gitlab_mrs {
-        let review_request = review_request_todos.get(&gl_mr.id);
-        let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let review_request = match todos_ok {
+            true => review_request_todos.get(&gl_mr.id).cloned(),
+            false => crate::polling::previous_mr_review_request(gl_mr.id)
+                .map(|(todo_id, by)| ReviewRequest { todo_id, by }),
+        };
+        let review_request = review_request.as_ref();
+        let fetched_notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let notes_ok = fetched_notes.is_some();
+        let notes = fetched_notes.unwrap_or_default();
         let approval_info =
             fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
-        let pipeline = fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
+        let pipeline = fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid)
+            .await
+            .unwrap_or_else(|_| crate::polling::previous_mr_pipeline_status(gl_mr.id));
         let reviewer_states =
             fetch_reviewer_states(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
         let requested_changes = me_requested_changes(&reviewer_states, uid);
-        let role = determine_role(gl_mr, uid, &username, &notes);
+        let role = determine_role(gl_mr, uid);
         let status = determine_status(gl_mr, approval_info.current, approval_info.required);
         let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
 
@@ -908,18 +891,32 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
         );
         let reminder = resolve_reminder(&app, gl_mr.id);
 
-        let updated_at = chrono::DateTime::parse_from_rfc3339(&gl_mr.updated_at)
+        // when notes failed, carry forward the previous snapshot's updated_at so the
+        // snapshot does not advance past the undetected change: keeping the new
+        // updated_at would make compute_notifications see it as unchanged on recovery
+        // and never fire the missed comment. fall back to the new value only when
+        // there is no previous snapshot (a brand-new MR notifies via NewMr anyway)
+        let updated_at_raw = match notes_ok {
+            true => gl_mr.updated_at.clone(),
+            false => crate::polling::previous_mr_updated_at_raw(gl_mr.id)
+                .unwrap_or_else(|| gl_mr.updated_at.clone()),
+        };
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
 
-        persist_read_state(
-            &app,
-            gl_mr.id,
-            read_status.unread,
-            &gl_mr.updated_at,
-            read_status.source,
-            review_request.map(|r| r.todo_id),
-        );
+        // skip persisting when notes could not be fetched: advancing the anchor to
+        // the new updated_at would permanently swallow an unseen comment
+        if notes_ok {
+            persist_read_state(
+                &app,
+                gl_mr.id,
+                read_status.unread,
+                &gl_mr.updated_at,
+                read_status.source,
+                review_request.map(|r| r.todo_id),
+            );
+        }
 
         let mr = MergeRequest {
             id: gl_mr.id,
@@ -945,7 +942,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             reminder,
             activity,
             latest_actor: read_status.latest_actor,
-            updated_at_raw: gl_mr.updated_at.clone(),
+            updated_at_raw,
             review_request_todo_id: review_request.map(|r| r.todo_id),
             review_request_by: review_request.map(|r| r.by.clone()),
         };
@@ -1094,6 +1091,29 @@ mod tests {
             web_url: String::new(),
             updated_at: T3.to_string(),
             project_id: 1,
+        }
+    }
+
+    fn gl_user(id: i64, username: &str) -> GitLabUser {
+        GitLabUser {
+            id,
+            username: username.to_string(),
+            name: format!("Name {username}"),
+            avatar_url: String::new(),
+        }
+    }
+
+    fn gl_mr_roles(
+        reviewers: Option<Vec<GitLabUser>>,
+        assignees: Option<Vec<GitLabUser>>,
+        state: &str,
+    ) -> GitLabMr {
+        GitLabMr {
+            reviewers,
+            assignees,
+            state: state.to_string(),
+            updated_at: T1.to_string(),
+            ..gl_mr()
         }
     }
 
@@ -1906,6 +1926,104 @@ mod tests {
             .map(|d| format!("2026-03-{:02}T10:00:00Z", d))
             .collect();
         assert_eq!(note_times, expected);
+    }
+
+    #[test]
+    fn determine_role_reviewer_wins_over_assignee() {
+        // arrange
+        let mr = gl_mr_roles(
+            Some(vec![gl_user(1, "me")]),
+            Some(vec![gl_user(1, "me")]),
+            "opened",
+        );
+
+        // act / assert
+        assert_eq!(determine_role(&mr, 1), UserRole::Reviewer);
+    }
+
+    #[test]
+    fn determine_role_assignee_when_not_reviewer() {
+        // arrange
+        let mr = gl_mr_roles(
+            Some(vec![gl_user(2, "other")]),
+            Some(vec![gl_user(1, "me")]),
+            "opened",
+        );
+
+        // act / assert
+        assert_eq!(determine_role(&mr, 1), UserRole::Assignee);
+    }
+
+    #[test]
+    fn determine_role_falls_back_to_reviewer() {
+        // arrange
+        let mr = gl_mr_roles(Some(vec![gl_user(2, "other")]), None, "opened");
+
+        // act / assert
+        assert_eq!(determine_role(&mr, 1), UserRole::Reviewer);
+    }
+
+    #[test]
+    fn determine_status_reflects_state_and_approvals() {
+        // act / assert
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "merged"), 0, 0),
+            MrStatus::Merged
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "closed"), 0, 0),
+            MrStatus::Closed
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 2, 2),
+            MrStatus::Approved
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 1, 2),
+            MrStatus::Open
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 0, 0),
+            MrStatus::Open
+        );
+    }
+
+    #[test]
+    fn make_initials_takes_first_two_word_starts_uppercased() {
+        // act / assert
+        assert_eq!(make_initials("backend-api-gateway"), "BA");
+        assert_eq!(make_initials("frontend"), "F");
+        assert_eq!(make_initials("my_cool service"), "MC");
+        assert_eq!(make_initials(""), "");
+    }
+
+    #[test]
+    fn notes_to_activity_orders_open_then_oldest_to_newest() {
+        // arrange
+        let mr = gl_mr_roles(None, None, "opened");
+        let notes = vec![note("alice", T3), note("bob", T2)];
+
+        // act
+        let activity = notes_to_activity(&notes, &mr);
+
+        // assert
+        let times: Vec<&str> = activity.iter().map(|e| e.time.as_str()).collect();
+        assert_eq!(times, vec![T1, T2, T3]);
+    }
+
+    #[test]
+    fn notes_to_activity_marks_system_notes_with_sys_author() {
+        // arrange
+        let mr = gl_mr_roles(None, None, "opened");
+        let sys = system_note("alice", T2);
+
+        // act
+        let activity = notes_to_activity(std::slice::from_ref(&sys), &mr);
+
+        // assert
+        let event = activity.last().unwrap();
+        assert_eq!(event.who, "sys");
+        assert_eq!(event.text, sys.body);
     }
 
     // --- ReadStateSource round-trip ---

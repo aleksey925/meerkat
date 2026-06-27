@@ -12,7 +12,6 @@ function roleLabel(role) {
   switch (role) {
     case "reviewer": return "Review";
     case "assignee": return "Assignee";
-    case "mentioned": return "@ Mentioned";
     default: return role || "—";
   }
 }
@@ -374,7 +373,6 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
             { key: "desktopNotif", label: "Desktop notifications", desc: "Show system notifications for new events" },
             { key: "soundNotif", label: "Sound", desc: "Play a sound when a new MR needs attention" },
             { key: "showDrafts", label: "Show drafts", desc: "Include draft merge requests in the feed" },
-            { key: "showMentions", label: "Show mentions", desc: "Include MRs where you are only mentioned" },
           ].map(({ key, label, desc }) => (
             <div className="toggle-row" key={key}>
               <div>
@@ -452,7 +450,6 @@ function InboxView({
       all: list.length,
       reviewer: list.filter((m) => m.role === "reviewer").length,
       assignee: list.filter((m) => m.role === "assignee").length,
-      mentioned: list.filter((m) => m.role === "mentioned").length,
     };
   })();
 
@@ -483,7 +480,6 @@ function InboxView({
               ["all", "All", roleCounts.all],
               ["reviewer", "Review", roleCounts.reviewer],
               ["assignee", "Assignee", roleCounts.assignee],
-              ["mentioned", "Mentioned", roleCounts.mentioned],
             ].map(([key, label, count]) => (
               <button key={key} className={`seg-btn ${selectedRole === key ? "active" : ""}`} onClick={() => onSelectRole(key)}>
                 {label}{count ? ` \u00B7 ${count}` : ""}

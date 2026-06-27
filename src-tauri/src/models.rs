@@ -14,7 +14,6 @@ pub struct UserInfo {
 pub enum UserRole {
     Reviewer,
     Assignee,
-    Mentioned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,7 +100,6 @@ pub struct Settings {
     pub token: Option<String>,
     pub poll_interval: String,
     pub show_drafts: bool,
-    pub show_mentions: bool,
     pub desktop_notif: bool,
     pub sound_notif: bool,
     pub connected: bool,
