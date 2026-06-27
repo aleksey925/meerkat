@@ -4,7 +4,10 @@ use tauri_plugin_store::StoreExt;
 
 const READ_STATE_STORE: &str = "mr_read_state.json";
 
-fn read_state(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str) -> (bool, String) {
+fn read_state(
+    store: &tauri_plugin_store::Store<tauri::Wry>,
+    key: &str,
+) -> (bool, String, Option<i64>) {
     store
         .get(key)
         .map(|v| {
@@ -15,12 +18,20 @@ fn read_state(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str) -> (bool
                     .and_then(|u| u.as_str())
                     .map(String::from)
                     .unwrap_or_default();
-                (unread, at)
+                let todo_id = obj.get("reviewRequestTodoId").and_then(|u| u.as_i64());
+                (unread, at, todo_id)
             } else {
-                (v.as_bool().unwrap_or(true), String::new())
+                (v.as_bool().unwrap_or(true), String::new(), None)
             }
         })
-        .unwrap_or((true, String::new()))
+        .unwrap_or((true, String::new(), None))
+}
+
+pub(crate) fn read_review_request_todo_id(
+    store: &tauri_plugin_store::Store<tauri::Wry>,
+    key: &str,
+) -> Option<i64> {
+    read_state(store, key).2
 }
 
 pub(crate) fn write_state(
@@ -29,6 +40,7 @@ pub(crate) fn write_state(
     unread: bool,
     updated_at: &str,
     source: &str,
+    review_request_todo_id: Option<i64>,
 ) {
     store.set(
         key,
@@ -36,6 +48,7 @@ pub(crate) fn write_state(
             "unread": unread,
             "updatedAt": updated_at,
             "source": source,
+            "reviewRequestTodoId": review_request_todo_id,
         }),
     );
 }
@@ -54,7 +67,7 @@ pub async fn toggle_unread(app: AppHandle, mr_id: i64) -> Result<bool, String> {
         .map_err(|e| format!("Store error: {e}"))?;
 
     let key = mr_id.to_string();
-    let (current_unread, mut updated_at) = read_state(&store, &key);
+    let (current_unread, mut updated_at, todo_id) = read_state(&store, &key);
 
     // legacy bool entries have no updatedAt — fall back to the latest known value
     // so the user-pin can be respected on the next fetch
@@ -63,7 +76,9 @@ pub async fn toggle_unread(app: AppHandle, mr_id: i64) -> Result<bool, String> {
     }
 
     let new_value = !current_unread;
-    write_state(&store, &key, new_value, &updated_at, "user");
+    // keep the stored todo id so the pin stays anchored to the current re-request:
+    // a later re-request gets a new todo id and correctly breaks the pin
+    write_state(&store, &key, new_value, &updated_at, "user", todo_id);
     store.save().map_err(|e| format!("Save error: {e}"))?;
 
     Ok(new_value)

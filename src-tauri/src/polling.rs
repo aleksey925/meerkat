@@ -128,7 +128,16 @@ fn check_and_fire_reminders(app: &AppHandle) {
                         })
                         .unwrap_or_default()
                 };
-                crate::commands::system::write_state(&read_store, &key, true, &updated_at, "user");
+                let todo_id =
+                    crate::commands::system::read_review_request_todo_id(&read_store, &key);
+                crate::commands::system::write_state(
+                    &read_store,
+                    &key,
+                    true,
+                    &updated_at,
+                    "user",
+                    todo_id,
+                );
                 let _ = read_store.save();
             }
 

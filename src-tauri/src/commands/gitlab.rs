@@ -577,7 +577,7 @@ struct ReadStatus {
 struct ReadSignals {
     approved_by_me: bool,
     i_requested_changes: bool,
-    review_requested: bool,
+    review_request_todo_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -586,6 +586,7 @@ enum StoredReadState {
         unread: bool,
         updated_at: String,
         source: ReadStateSource,
+        review_request_todo_id: Option<i64>,
     },
     LegacyBool(bool),
 }
@@ -603,10 +604,12 @@ fn parse_stored_read_state(val: &serde_json::Value) -> Option<StoredReadState> {
             .and_then(|v| v.as_str())
             .map(ReadStateSource::from_stored)
             .unwrap_or(ReadStateSource::Auto);
+        let review_request_todo_id = obj.get("reviewRequestTodoId").and_then(|v| v.as_i64());
         return Some(StoredReadState::Full {
             unread,
             updated_at,
             source,
+            review_request_todo_id,
         });
     }
     if let Some(b) = val.as_bool() {
@@ -622,21 +625,31 @@ fn decide_unread_status(
     current_username: &str,
     signals: ReadSignals,
 ) -> ReadStatus {
-    let (stored_unread, stored_updated, stored_source) = match stored {
+    let (stored_unread, stored_updated, stored_source, stored_todo) = match stored {
         Some(StoredReadState::Full {
             unread,
             updated_at,
             source,
-        }) => (Some(*unread), Some(updated_at.as_str()), Some(*source)),
-        Some(StoredReadState::LegacyBool(b)) => (Some(*b), None, None),
-        None => (None, None, None),
+            review_request_todo_id,
+        }) => (
+            Some(*unread),
+            Some(updated_at.as_str()),
+            Some(*source),
+            *review_request_todo_id,
+        ),
+        Some(StoredReadState::LegacyBool(b)) => (Some(*b), None, None, None),
+        None => (None, None, None, None),
     };
 
-    // 1. user pinned the state and MR hasn't changed — respect it
+    // 1. user pinned the state and MR hasn't changed - respect it. the pin is
+    // anchored to the review-request todo too: a fresh re-request keeps the same
+    // updated_at and leaves no note, so without this a manually-read MR would
+    // stay read while the re-request notification fires (read state and todo
+    // would disagree).
     if let (Some(unread), Some(stored_ts), Some(ReadStateSource::User)) =
         (stored_unread, stored_updated, stored_source)
     {
-        if stored_ts == updated_at {
+        if stored_ts == updated_at && stored_todo == signals.review_request_todo_id {
             return ReadStatus {
                 unread,
                 latest_actor: None,
@@ -649,7 +662,7 @@ fn decide_unread_status(
     // because a re-request means the author wants another look even if a stale
     // approval is still on record. notification is driven separately by the
     // todo id (re-request leaves no note and doesn't move updated_at).
-    if signals.review_requested {
+    if signals.review_request_todo_id.is_some() {
         return ReadStatus {
             unread: true,
             latest_actor: None,
@@ -756,6 +769,7 @@ fn persist_read_state(
     unread: bool,
     updated_at: &str,
     source: ReadStateSource,
+    review_request_todo_id: Option<i64>,
 ) {
     if let Ok(store) = app.store("mr_read_state.json") {
         store.set(
@@ -764,6 +778,7 @@ fn persist_read_state(
                 "unread": unread,
                 "updatedAt": updated_at,
                 "source": source.as_str(),
+                "reviewRequestTodoId": review_request_todo_id,
             }),
         );
         let _ = store.save();
@@ -888,7 +903,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             ReadSignals {
                 approved_by_me: approval_info.approved_by_me,
                 i_requested_changes: requested_changes,
-                review_requested: review_request.is_some(),
+                review_request_todo_id: review_request.map(|r| r.todo_id),
             },
         );
         let reminder = resolve_reminder(&app, gl_mr.id);
@@ -903,6 +918,7 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             read_status.unread,
             &gl_mr.updated_at,
             read_status.source,
+            review_request.map(|r| r.todo_id),
         );
 
         let mr = MergeRequest {
@@ -980,6 +996,21 @@ mod tests {
             unread,
             updated_at: updated_at.to_string(),
             source,
+            review_request_todo_id: None,
+        }
+    }
+
+    fn full_todo(
+        unread: bool,
+        updated_at: &str,
+        source: ReadStateSource,
+        review_request_todo_id: Option<i64>,
+    ) -> StoredReadState {
+        StoredReadState::Full {
+            unread,
+            updated_at: updated_at.to_string(),
+            source,
+            review_request_todo_id,
         }
     }
 
@@ -997,7 +1028,7 @@ mod tests {
             ReadSignals {
                 approved_by_me,
                 i_requested_changes: false,
-                review_requested: false,
+                review_request_todo_id: None,
             },
         )
     }
@@ -1017,7 +1048,7 @@ mod tests {
             ReadSignals {
                 approved_by_me,
                 i_requested_changes,
-                review_requested: false,
+                review_request_todo_id: None,
             },
         )
     }
@@ -1026,6 +1057,7 @@ mod tests {
         stored: Option<&StoredReadState>,
         updated_at: &str,
         approved_by_me: bool,
+        review_request_todo_id: Option<i64>,
     ) -> ReadStatus {
         decide_unread_status(
             stored,
@@ -1035,7 +1067,7 @@ mod tests {
             ReadSignals {
                 approved_by_me,
                 i_requested_changes: false,
-                review_requested: true,
+                review_request_todo_id,
             },
         )
     }
@@ -1138,6 +1170,20 @@ mod tests {
         assert_eq!(
             parse_stored_read_state(&val),
             Some(full(false, T1, ReadStateSource::User))
+        );
+    }
+
+    #[test]
+    fn parse_full_object_extracts_review_request_todo_id() {
+        let val = serde_json::json!({
+            "unread": false,
+            "updatedAt": T1,
+            "source": "user",
+            "reviewRequestTodoId": 42,
+        });
+        assert_eq!(
+            parse_stored_read_state(&val),
+            Some(full_todo(false, T1, ReadStateSource::User, Some(42)))
         );
     }
 
@@ -1433,7 +1479,7 @@ mod tests {
     #[test]
     fn review_request_pending_marks_unread() {
         let stored = full(false, T1, ReadStateSource::Auto);
-        let r = decide_with_review_request(Some(&stored), T1, false);
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(1));
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1441,17 +1487,39 @@ mod tests {
     #[test]
     fn review_request_overrides_active_approval() {
         let stored = full(false, T1, ReadStateSource::Auto);
-        let r = decide_with_review_request(Some(&stored), T1, true);
+        let r = decide_with_review_request(Some(&stored), T1, true, Some(1));
         assert!(r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     #[test]
-    fn user_pin_unchanged_mr_with_review_request_respects_pin() {
-        let stored = full(false, T1, ReadStateSource::User);
-        let r = decide_with_review_request(Some(&stored), T1, false);
+    fn user_pin_unchanged_mr_with_same_review_request_respects_pin() {
+        // user read the MR while this re-request todo was already pending: the todo
+        // id matches the pin anchor, so the pin holds
+        let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(7));
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::User);
+    }
+
+    #[test]
+    fn user_pin_broken_by_new_review_request() {
+        // user read the MR with no re-request pending, then a re-request arrives:
+        // a fresh todo id breaks the pin and marks the MR unread
+        let stored = full_todo(false, T1, ReadStateSource::User, None);
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(9));
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
+    }
+
+    #[test]
+    fn user_pin_broken_by_changed_review_request_todo() {
+        // user read the MR during one re-request, then the author re-requests again
+        // (new todo id) without touching updated_at: the pin must break
+        let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
+        let r = decide_with_review_request(Some(&stored), T1, false, Some(9));
+        assert!(r.unread);
+        assert_eq!(r.source, ReadStateSource::Auto);
     }
 
     // --- me_requested_changes helper ---
