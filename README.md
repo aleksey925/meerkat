@@ -28,6 +28,21 @@ changes.
 
 ## Installation
 
+### Homebrew
+
+The easiest way is via [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask aleksey925/apps/meerkat
+```
+
+> **Note:** Meerkat is not signed with an Apple Developer certificate, so macOS 
+> Gatekeeper would normally block it. The cask handles this for you: during install
+> it runs `xattr -dr com.apple.quarantine` on the app to strip the quarantine flag,
+> so no extra steps are needed.
+
+### Manual
+
 Download the latest release from [releases](https://github.com/aleksey925/meerkat/releases)
 and install it manually.
 
@@ -35,7 +50,7 @@ and install it manually.
 > will show a warning that the app is damaged or can't be opened. To fix this, run:
 >
 > ```bash
-> xattr -cr /Applications/Meerkat.app
+> xattr -dr com.apple.quarantine /Applications/Meerkat.app
 > ```
 >
 > Alternatively, you can [build from source](#build) on your machine to avoid this issue.
