@@ -65,7 +65,7 @@ function Toast({ message }) {
   return <div className="toast">{message}</div>;
 }
 
-export function computeReminderDate(label) {
+function computeReminderDate(label) {
   const now = new Date();
   switch (label) {
     case "In 30 minutes": now.setMinutes(now.getMinutes() + 30); break;
