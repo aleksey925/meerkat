@@ -18,6 +18,11 @@ sed -e "s/__VERSION__/${version}/g" -e "s/__SHA256__/${sha256}/g" \
   "$template" > "$tap_dir/Casks/meerkat.rb"
 
 git -C "$tap_dir" add Casks/meerkat.rb
+if git -C "$tap_dir" diff --cached --quiet; then
+  echo "cask already up to date, nothing to push"
+  exit 0
+fi
+
 git -C "$tap_dir" \
   -c user.name="Aleksey Petrunnik" \
   -c user.email="petrunnik.a@gmail.com" \

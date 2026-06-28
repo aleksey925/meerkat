@@ -34,4 +34,4 @@ jobs:
       - name: Update Homebrew cask
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: ./scripts/update-homebrew-cask.sh
+        run: bash scripts/update-homebrew-cask.sh
