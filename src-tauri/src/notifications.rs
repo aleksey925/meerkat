@@ -116,7 +116,7 @@ pub fn send_notification(app: &AppHandle, title: &str, body: &str) {
     }
 
     if let Err(e) = builder.show() {
-        log::warn!("Failed to send notification: {}", e);
+        log::warn!("Failed to send notification: {e}");
     }
 }
 

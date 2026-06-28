@@ -34,14 +34,11 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let has_token = credentials::get_token()?.is_some();
+    let stored_token = credentials::get_token()?;
+    let has_token = stored_token.is_some();
     let connected = has_token && store.get("user_id").is_some() && !url.is_empty();
 
-    let token_display = if has_token {
-        credentials::get_token()?.and_then(|t| if t.is_empty() { None } else { Some(t) })
-    } else {
-        None
-    };
+    let token_display = stored_token.filter(|t| !t.is_empty());
 
     Ok(Settings {
         url,
@@ -54,25 +51,54 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
     })
 }
 
+// persists non-identity settings only. the identity (url + token) is owned by
+// `connect`, so a preferences save never touches it and needs no validation or
+// poll restart.
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
+pub async fn save_preferences(app: AppHandle, settings: Settings) -> Result<(), String> {
     let store = app
         .store("settings.json")
         .map_err(|e| format!("Store error: {e}"))?;
 
-    store.set("gitlab_url", serde_json::json!(settings.url));
     store.set("poll_interval", serde_json::json!(settings.poll_interval));
     store.set("show_drafts", serde_json::json!(settings.show_drafts));
     store.set("desktop_notif", serde_json::json!(settings.desktop_notif));
     store.set("sound_notif", serde_json::json!(settings.sound_notif));
     store.save().map_err(|e| format!("Save error: {e}"))?;
 
-    // Token stored via OS keychain, not in the store file
-    if let Some(ref token) = settings.token {
-        if !token.is_empty() {
-            credentials::store_token(token)?;
-        }
-    }
-
     Ok(())
+}
+
+// stops polling and drops the identity so the app returns to a disconnected
+// state. per-account stores are left in place, so reconnecting the same account
+// restores its read-state and reminders.
+#[tauri::command]
+pub async fn disconnect(app: AppHandle) -> Result<(), String> {
+    crate::polling::stop_polling();
+
+    let store = app
+        .store("settings.json")
+        .map_err(|e| format!("Store error: {e}"))?;
+    store.delete("user_id");
+    store.delete("username");
+    store.save().map_err(|e| format!("Save error: {e}"))?;
+
+    credentials::delete_token()?;
+    crate::polling::reset_previous_mrs();
+    Ok(())
+}
+
+// whether a usable identity is configured: a url, a validated user_id, and a
+// stored token. used at startup to decide whether to begin polling.
+pub(crate) fn is_connected(app: &AppHandle) -> bool {
+    let Ok(store) = app.store("settings.json") else {
+        return false;
+    };
+    let has_url = store
+        .get("gitlab_url")
+        .and_then(|v| v.as_str().map(String::from))
+        .is_some_and(|u| !u.is_empty());
+    let has_user = store.get("user_id").and_then(|v| v.as_i64()).is_some();
+    let has_token = credentials::get_token().ok().flatten().is_some();
+    has_url && has_user && has_token
 }

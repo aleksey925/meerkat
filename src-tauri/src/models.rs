@@ -82,7 +82,7 @@ pub struct ActivityEvent {
     pub color: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
     pub id: i64,
@@ -128,6 +128,7 @@ pub struct GitLabMr {
     pub work_in_progress: Option<bool>,
     pub has_conflicts: Option<bool>,
     pub web_url: String,
+    pub created_at: String,
     pub updated_at: String,
     pub project_id: i64,
 }
@@ -143,7 +144,6 @@ pub struct GitLabUser {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabPipeline {
-    pub id: i64,
     pub status: String,
 }
 
@@ -169,8 +169,6 @@ pub struct GitLabTodoTarget {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabApprovals {
-    pub approved: Option<bool>,
-    pub approvals_left: Option<i32>,
     pub approvals_required: Option<i32>,
     pub approved_by: Option<Vec<GitLabApprovalUser>>,
 }
@@ -182,17 +180,14 @@ pub struct GitLabApprovalUser {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabNote {
-    pub id: i64,
     pub body: String,
     pub author: GitLabUser,
     pub created_at: String,
     pub system: Option<bool>,
-    pub noteable_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabProject {
-    pub id: i64,
     pub name: String,
     pub namespace: GitLabNamespace,
 }
@@ -200,5 +195,4 @@ pub struct GitLabProject {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabNamespace {
     pub name: String,
-    pub full_path: String,
 }

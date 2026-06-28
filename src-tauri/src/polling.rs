@@ -3,41 +3,53 @@ use crate::models::{MergeRequest, PipelineStatus};
 use crate::notifications;
 use chrono::Utc;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_store::StoreExt;
+use tokio::sync::Notify;
 use tokio::time::Duration;
 
-static POLLING_ACTIVE: AtomicBool = AtomicBool::new(false);
-static CHECK_CYCLE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_MRS: Mutex<Option<Vec<MergeRequest>>> = Mutex::new(None);
+// the single active polling task. starting a new one aborts the previous, so a
+// connect/disconnect can never leave two loops running and a superseded loop
+// cannot emit stale data (an aborted task is cancelled at its next await).
+static POLL_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+// wakes the polling loop early for a manual check_now (see start_polling).
+static WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+// clears the in-memory snapshot so a freshly connected account does not diff its
+// MRs against the previous account's and fire false notifications. per-account
+// read-state and reminders live in their own files (see account_store_name), so
+// nothing on disk needs clearing.
+pub(crate) fn reset_previous_mrs() {
+    if let Ok(mut prev) = PREVIOUS_MRS.lock() {
+        *prev = None;
+    }
+}
+
+fn with_previous_mr<T>(mr_id: i64, f: impl FnOnce(&MergeRequest) -> T) -> Option<T> {
+    let prev = PREVIOUS_MRS.lock().ok()?;
+    let mr = prev.as_ref()?.iter().find(|m| m.id == mr_id)?;
+    Some(f(mr))
+}
 
 pub(crate) fn previous_mr_updated_at_raw(mr_id: i64) -> Option<String> {
-    let prev = PREVIOUS_MRS.lock().ok()?;
-    let mrs = prev.as_ref()?;
-    mrs.iter()
-        .find(|m| m.id == mr_id)
-        .map(|m| m.updated_at_raw.clone())
+    with_previous_mr(mr_id, |m| m.updated_at_raw.clone())
 }
 
 pub(crate) fn previous_mr_pipeline_status(mr_id: i64) -> Option<PipelineStatus> {
-    let prev = PREVIOUS_MRS.lock().ok()?;
-    let mrs = prev.as_ref()?;
-    mrs.iter()
-        .find(|m| m.id == mr_id)
-        .and_then(|m| m.pipeline_status.clone())
+    with_previous_mr(mr_id, |m| m.pipeline_status.clone())?
 }
 
 // previous (todo_id, requested_by) for an MR, used to carry the re-request
 // forward when the todos fetch fails so a transient outage neither drops the
 // re-request nor re-fires its notification on recovery
 pub(crate) fn previous_mr_review_request(mr_id: i64) -> Option<(i64, String)> {
-    let prev = PREVIOUS_MRS.lock().ok()?;
-    let mrs = prev.as_ref()?;
-    let mr = mrs.iter().find(|m| m.id == mr_id)?;
-    let todo_id = mr.review_request_todo_id?;
-    Some((todo_id, mr.review_request_by.clone().unwrap_or_default()))
+    with_previous_mr(mr_id, |m| {
+        m.review_request_todo_id
+            .map(|todo_id| (todo_id, m.review_request_by.clone().unwrap_or_default()))
+    })?
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,8 +145,29 @@ fn detect_changes_and_notify(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReminderDue {
+    Due,
+    Pending,
+    Invalid,
+}
+
+fn reminder_due_state(at_str: &str, now: chrono::DateTime<Utc>) -> ReminderDue {
+    match chrono::DateTime::parse_from_rfc3339(at_str) {
+        Ok(dt) if dt.with_timezone(&Utc) <= now => ReminderDue::Due,
+        Ok(_) => ReminderDue::Pending,
+        Err(_) => ReminderDue::Invalid,
+    }
+}
+
 fn check_and_fire_reminders(app: &AppHandle) {
-    let reminder_store = match app.store("reminders.json") {
+    let Some(reminder_name) = crate::commands::system::account_store_name(
+        app,
+        crate::commands::reminders::REMINDERS_PREFIX,
+    ) else {
+        return;
+    };
+    let reminder_store = match app.store(reminder_name) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -144,12 +177,8 @@ fn check_and_fire_reminders(app: &AppHandle) {
         .keys()
         .into_iter()
         .filter_map(|key| {
-            let val = reminder_store.get(&key)?;
-            let at_str = if let Some(obj) = val.as_object() {
-                obj.get("at")?.as_str()?.to_string()
-            } else {
-                val.as_str()?.to_string()
-            };
+            let at_str =
+                crate::commands::reminders::reminder_field(&reminder_store.get(&key)?, "at")?;
             Some((key, at_str))
         })
         .collect();
@@ -157,73 +186,72 @@ fn check_and_fire_reminders(app: &AppHandle) {
     let mut fired_ids: Vec<i64> = Vec::new();
 
     for (key, at_str) in entries {
-        let reminder_time = match chrono::DateTime::parse_from_rfc3339(&at_str) {
-            Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => {
-                // legacy unparseable value — will never fire, clean it up
+        match reminder_due_state(&at_str, now) {
+            ReminderDue::Pending => continue,
+            ReminderDue::Invalid => {
+                // unparseable value will never fire, clean it up
                 reminder_store.delete(&key);
                 let _ = reminder_store.save();
                 continue;
             }
+            ReminderDue::Due => {}
+        }
+
+        let mr_id: i64 = match key.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
         };
 
-        if reminder_time <= now {
-            let mr_id: i64 = match key.parse() {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-
-            let (title, prev_updated_at) = {
-                let prev = PREVIOUS_MRS.lock().ok();
-                let mr = prev
-                    .as_ref()
-                    .and_then(|opt| opt.as_ref())
-                    .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id).cloned());
-                match mr {
-                    Some(m) => (m.title, m.updated_at_raw),
-                    None => (format!("MR #{}", mr_id), String::new()),
-                }
-            };
-
-            notifications::notify_reminder(app, &title);
-
-            // mark as unread, pinned by user (reminder is treated as a user action).
-            // if PREVIOUS_MRS doesn't have the MR (e.g. first cycle of a fresh session),
-            // preserve the updatedAt that's already in the store so the pin survives the
-            // upcoming fetch.
-            if let Ok(read_store) = app.store(crate::commands::system::READ_STATE_STORE) {
-                let updated_at = if !prev_updated_at.is_empty() {
-                    prev_updated_at
-                } else {
-                    read_store
-                        .get(&key)
-                        .and_then(|v| {
-                            v.as_object().and_then(|o| {
-                                o.get("updatedAt")
-                                    .and_then(|u| u.as_str())
-                                    .map(String::from)
-                            })
-                        })
-                        .unwrap_or_default()
-                };
-                let todo_id =
-                    crate::commands::system::read_review_request_todo_id(&read_store, &key);
-                crate::commands::system::write_state(
-                    &read_store,
-                    &key,
-                    true,
-                    &updated_at,
-                    "user",
-                    todo_id,
-                );
-                let _ = read_store.save();
+        let (title, prev_updated_at) = {
+            let prev = PREVIOUS_MRS.lock().ok();
+            let mr = prev
+                .as_ref()
+                .and_then(|opt| opt.as_ref())
+                .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id).cloned());
+            match mr {
+                Some(m) => (m.title, m.updated_at_raw),
+                None => (format!("MR #{mr_id}"), String::new()),
             }
+        };
 
-            reminder_store.delete(&key);
-            let _ = reminder_store.save();
+        notifications::notify_reminder(app, &title);
 
-            fired_ids.push(mr_id);
+        // mark as unread, pinned by user (reminder is treated as a user action).
+        // if PREVIOUS_MRS doesn't have the MR (e.g. first cycle of a fresh session),
+        // preserve the updatedAt that's already in the store so the pin survives the
+        // upcoming fetch.
+        let read_store = crate::commands::system::account_store_name(
+            app,
+            crate::commands::system::READ_STATE_PREFIX,
+        )
+        .and_then(|name| app.store(name).ok());
+        if let Some(read_store) = read_store {
+            let updated_at = if !prev_updated_at.is_empty() {
+                prev_updated_at
+            } else {
+                read_store
+                    .get(&key)
+                    .as_ref()
+                    .and_then(crate::commands::system::StoredReadState::parse)
+                    .and_then(|s| s.updated_at().map(String::from))
+                    .unwrap_or_default()
+            };
+            let todo_id = crate::commands::system::read_review_request_todo_id(&read_store, &key);
+            crate::commands::system::write_state(
+                &read_store,
+                &key,
+                true,
+                &updated_at,
+                crate::commands::system::ReadStateSource::User,
+                todo_id,
+            );
+            let _ = read_store.save();
         }
+
+        reminder_store.delete(&key);
+        let _ = reminder_store.save();
+
+        fired_ids.push(mr_id);
     }
 
     if !fired_ids.is_empty() {
@@ -231,29 +259,7 @@ fn check_and_fire_reminders(app: &AppHandle) {
     }
 }
 
-pub async fn run_check_cycle(app: &AppHandle, manual: bool) -> Result<(), String> {
-    if CHECK_CYCLE_RUNNING.swap(true, Ordering::SeqCst) {
-        if manual {
-            let _ = app.emit("check-already-running", ());
-        }
-        return Ok(());
-    }
-
-    if manual {
-        let _ = app.emit("check-started", ());
-    }
-
-    let result = run_check_cycle_inner(app).await;
-
-    if manual {
-        let _ = app.emit("check-finished", result.is_ok());
-    }
-
-    CHECK_CYCLE_RUNNING.store(false, Ordering::SeqCst);
-    result
-}
-
-async fn run_check_cycle_inner(app: &AppHandle) -> Result<(), String> {
+async fn run_check_cycle(app: &AppHandle) -> Result<(), String> {
     check_and_fire_reminders(app);
 
     match fetch_merge_requests(app.clone()).await {
@@ -273,72 +279,75 @@ async fn run_check_cycle_inner(app: &AppHandle) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            log::warn!("Polling error: {}", e);
-            let user_message = if e.contains("TOKEN_EXPIRED") || e.contains("Invalid token") {
-                "Token expired. Update in Settings.".to_string()
-            } else if e.contains("not configured") {
-                e.clone()
-            } else if e.contains("Connection failed") {
-                "Connection failed. Check your network.".to_string()
-            } else if e.contains("Rate limited") {
-                "Rate limited by GitLab. Try again later.".to_string()
-            } else {
-                "Failed to update. Try again later.".to_string()
-            };
+            log::warn!("Polling error: {e}");
+            let user_message = user_facing_error(&e);
             let _ = app.emit("connection-error", &user_message);
             Err(user_message)
         }
     }
 }
 
-pub fn start_polling_task(app: AppHandle) {
-    if POLLING_ACTIVE.swap(true, Ordering::SeqCst) {
-        return;
+fn user_facing_error(raw: &str) -> String {
+    if raw.contains("TOKEN_EXPIRED") || raw.contains("Invalid token") {
+        "Token expired. Update in Settings.".to_string()
+    } else if raw.contains("not configured") {
+        raw.to_string()
+    } else if raw.contains("Connection failed") {
+        "Connection failed. Check your network.".to_string()
+    } else if raw.contains("Rate limited") {
+        "Rate limited by GitLab. Try again later.".to_string()
+    } else {
+        "Failed to update. Try again later.".to_string()
     }
+}
 
-    tauri::async_runtime::spawn(async move {
+fn poll_interval_secs(app: &AppHandle) -> u64 {
+    app.store("settings.json")
+        .ok()
+        .and_then(|s| {
+            s.get("poll_interval")
+                .and_then(|v| v.as_str().map(String::from))
+        })
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
+// starts the single polling task, aborting any previous one first.
+pub(crate) fn start_polling(app: AppHandle) {
+    let mut slot = POLL_TASK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = slot.take() {
+        handle.abort();
+    }
+    let handle = tauri::async_runtime::spawn(async move {
         loop {
-            if !POLLING_ACTIVE.load(Ordering::SeqCst) {
-                break;
+            // run a cycle immediately on start, not just after the first
+            // interval: this seeds PREVIOUS_MRS and populates the UI. the seeding
+            // cycle has no previous snapshot, so it sets the baseline without
+            // notifying for every existing MR.
+            let _ = run_check_cycle(&app).await;
+
+            let interval = Duration::from_secs(poll_interval_secs(&app));
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                // a manual check_now wakes the loop so the refresh reuses this
+                // single fetch path instead of running a second concurrent one
+                _ = WAKE.notified() => {}
             }
-
-            let poll_secs = {
-                let store = app.store("settings.json").ok();
-                store
-                    .and_then(|s| {
-                        s.get("poll_interval")
-                            .and_then(|v| v.as_str().map(String::from))
-                    })
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(30)
-            };
-
-            tokio::time::sleep(Duration::from_secs(poll_secs)).await;
-
-            if !POLLING_ACTIVE.load(Ordering::SeqCst) {
-                break;
-            }
-
-            let _ = run_check_cycle(&app, false).await;
         }
     });
+    *slot = Some(handle);
+}
+
+pub(crate) fn stop_polling() {
+    let mut slot = POLL_TASK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = slot.take() {
+        handle.abort();
+    }
 }
 
 #[tauri::command]
-pub fn start_polling(app: AppHandle) -> Result<(), String> {
-    start_polling_task(app);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn stop_polling() -> Result<(), String> {
-    POLLING_ACTIVE.store(false, Ordering::SeqCst);
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn check_now(app: AppHandle) -> Result<(), String> {
-    run_check_cycle(&app, true).await
+pub fn check_now() {
+    WAKE.notify_one();
 }
 
 #[cfg(test)]
@@ -424,7 +433,7 @@ mod tests {
 
     #[test]
     fn updated_at_change_without_actor_fires_nothing() {
-        // arrange — own action: updated_at moved but no actor attributed
+        // arrange
         let prev = mr(1, T1);
         let new = mr(1, T2);
 
@@ -481,7 +490,7 @@ mod tests {
 
     #[test]
     fn cleared_review_request_todo_fires_nothing() {
-        // arrange — todo went Some(5) -> None: the is_some() guard suppresses it
+        // arrange
         let mut prev = mr(1, T1);
         prev.review_request_todo_id = Some(5);
         let new = mr(1, T1);
@@ -512,7 +521,7 @@ mod tests {
 
     #[test]
     fn combined_update_and_new_review_request_fires_both() {
-        // arrange — updated_at moved with an actor AND a fresh re-request todo
+        // arrange
         let prev = mr(1, T1);
         let mut new = mr(1, T2);
         new.latest_actor = Some("Alice".to_string());
@@ -583,7 +592,7 @@ mod tests {
 
     #[test]
     fn pipeline_fail_to_fail_fires_nothing() {
-        // arrange — already failing, no fresh transition
+        // arrange
         let mut prev = mr(1, T1);
         prev.pipeline_status = Some(PipelineStatus::Fail);
         let mut new = mr(1, T1);
@@ -595,5 +604,63 @@ mod tests {
 
         // assert
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn user_facing_error_maps_each_branch_with_precedence() {
+        // assert
+        assert_eq!(
+            user_facing_error("TOKEN_EXPIRED"),
+            "Token expired. Update in Settings."
+        );
+        assert_eq!(
+            user_facing_error("Invalid token format"),
+            "Token expired. Update in Settings."
+        );
+        assert_eq!(
+            user_facing_error("GitLab URL or token not configured"),
+            "GitLab URL or token not configured"
+        );
+        assert_eq!(
+            user_facing_error("Connection failed: timeout"),
+            "Connection failed. Check your network."
+        );
+        assert_eq!(
+            user_facing_error("Rate limited by GitLab. Try again later."),
+            "Rate limited by GitLab. Try again later."
+        );
+        assert_eq!(
+            user_facing_error("GitLab API error: 503"),
+            "Failed to update. Try again later."
+        );
+    }
+
+    #[test]
+    fn user_facing_error_token_branch_wins_over_connection() {
+        // arrange
+        let raw = "Connection failed: Invalid token";
+
+        // act
+        let msg = user_facing_error(raw);
+
+        // assert
+        assert_eq!(msg, "Token expired. Update in Settings.");
+    }
+
+    #[test]
+    fn reminder_due_state_classifies_by_time_and_validity() {
+        // arrange
+        let now = chrono::DateTime::parse_from_rfc3339(T2)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // assert
+        assert_eq!(reminder_due_state(T1, now), ReminderDue::Due);
+        assert_eq!(reminder_due_state(T2, now), ReminderDue::Due);
+        assert_eq!(
+            reminder_due_state("2099-01-01T00:00:00Z", now),
+            ReminderDue::Pending
+        );
+        assert_eq!(reminder_due_state("not-a-date", now), ReminderDue::Invalid);
     }
 }

@@ -52,59 +52,81 @@ export function useSettings(showToast) {
     setSettings(newSettings);
   }, []);
 
-  const saveSettings = useCallback(async (overrides) => {
-    const invoke = getTauriInvoke();
-    if (!invoke) {
-      showToast("Tauri not available. Cannot save settings.");
-      return;
-    }
-    const s = overrides || settings;
-    try {
-      await invoke("save_settings", {
-        settings: {
-          url: s.url,
-          token: s.token,
-          pollInterval: s.pollInterval,
-          showDrafts: s.showDrafts,
-          desktopNotif: s.desktopNotif,
-          soundNotif: s.soundNotif,
-          connected: s.connected,
-        },
-      });
-      if (!overrides) {
-        showToast("Settings saved");
+  // persists non-identity settings (interval, drafts, notifications). the
+  // identity is committed only by connect, so this never touches url/token.
+  const savePreferences = useCallback(
+    async (overrides) => {
+      const invoke = getTauriInvoke();
+      if (!invoke) {
+        showToast("Tauri not available. Cannot save settings.");
+        return;
       }
-    } catch (e) {
-      showToast(`Error: ${e}`);
-    }
-  }, [settings, showToast]);
+      const s = overrides || settings;
+      try {
+        await invoke("save_preferences", {
+          settings: {
+            url: s.url,
+            token: s.token,
+            pollInterval: s.pollInterval,
+            showDrafts: s.showDrafts,
+            desktopNotif: s.desktopNotif,
+            soundNotif: s.soundNotif,
+            connected: s.connected,
+          },
+        });
+      } catch (e) {
+        showToast(`Error: ${e}`);
+      }
+    },
+    [settings, showToast],
+  );
 
-  const testConnection = useCallback(async () => {
+  // validates and commits the identity in one step; the backend restarts polling
+  // on success. returns true so the caller can refresh the view.
+  const connect = useCallback(async () => {
     const invoke = getTauriInvoke();
     if (!invoke) {
-      showToast("Tauri not available. Cannot test connection.");
-      return;
+      showToast("Tauri not available. Cannot connect.");
+      return false;
     }
 
-    showToast("Testing connection...");
+    showToast("Connecting...");
     try {
-      const user = await invoke("test_connection", {
+      const user = await invoke("connect", {
         url: settings.url,
         token: settings.token,
       });
       setSettings((prev) => ({ ...prev, connected: true }));
       showToast(`Connected as ${user.name}`);
+      return true;
     } catch (e) {
       setSettings((prev) => ({ ...prev, connected: false }));
       showToast(`Connection failed: ${e}`);
+      return false;
     }
   }, [settings.url, settings.token, showToast]);
+
+  const disconnect = useCallback(async () => {
+    const invoke = getTauriInvoke();
+    if (!invoke) {
+      showToast("Tauri not available.");
+      return;
+    }
+    try {
+      await invoke("disconnect");
+      setSettings((prev) => ({ ...prev, token: "", connected: false }));
+      showToast("Disconnected");
+    } catch (e) {
+      showToast(`Error: ${e}`);
+    }
+  }, [showToast]);
 
   return {
     settings,
     loading,
     updateSettings,
-    saveSettings,
-    testConnection,
+    savePreferences,
+    connect,
+    disconnect,
   };
 }
