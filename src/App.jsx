@@ -8,12 +8,20 @@ import { useGitlab } from "./hooks/useGitlab";
 import CustomReminderModal from "./components/CustomReminderModal";
 
 // ─── Utility Helpers ───────────────────────────────────────────────────────
+// mirrors the Rust ACCENT_COLOR (see src-tauri/src/commands/gitlab.rs); the
+// `--accent` CSS var differs, so keep this value in sync across the boundary.
+const ACCENT_COLOR = "#5e5ce6";
+
+// fallback anchor for reminder popups opened from a button rather than a
+// right-click, where no cursor position is available
+const REMINDER_POPUP_POS = { x: 400, y: 300 };
+const CUSTOM_REMINDER_POPUP_POS = { x: 400, y: 200 };
+
 function roleLabel(role) {
   switch (role) {
     case "reviewer": return "Review";
     case "assignee": return "Assignee";
-    case "mentioned": return "@ Mentioned";
-    default: return role || "—";
+    default: return role || "-";
   }
 }
 
@@ -29,13 +37,13 @@ function pipelineLabel(pipeline) {
 function getAuthorInfo(mr) {
   return {
     name: mr.authorName || "Unknown",
-    color: "#5e5ce6",
+    color: ACCENT_COLOR,
     initials: (mr.authorUsername || "?").substring(0, 2).toUpperCase(),
   };
 }
 
-function getProjectId(mr) {
-  return mr.projectId || mr.project;
+function visibleMergeRequests(mergeRequests, showDrafts) {
+  return showDrafts ? mergeRequests : mergeRequests.filter((m) => !m.draft);
 }
 
 function useRelativeTime(date) {
@@ -155,10 +163,10 @@ function ContextMenu({ mr, position, onClose, onToggleUnread, onSetReminder, onC
 // ─── MR Card Component ─────────────────────────────────────────────────────
 function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggleUnread }) {
   const author = getAuthorInfo(mr);
-  const pipeline = mr.pipelineStatus || mr.pipeline;
-  const approvals = mr.approvalsCurrent ?? mr.approvals ?? 0;
-  const needed = mr.approvalsRequired ?? mr.needed ?? 0;
-  const conflicts = mr.hasConflicts ?? mr.conflicts ?? false;
+  const pipeline = mr.pipelineStatus;
+  const approvals = mr.approvalsCurrent ?? 0;
+  const needed = mr.approvalsRequired ?? 0;
+  const conflicts = mr.hasConflicts ?? false;
 
   return (
     <div
@@ -192,10 +200,10 @@ function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggl
             </div>
           </div>
           <div className="mr-subtitle">
-            <span className="mr-author-ava" style={{ background: author.color }}>{author.initials || (mr.authorUsername || "?").substring(0, 2).toUpperCase()}</span>
+            <span className="mr-author-ava" style={{ background: author.color }}>{author.initials}</span>
             <span style={{ marginLeft: 4 }}>{author.name}</span>
             <span className="mr-sep">{"\u00B7"}</span>
-            <span className="mr-branch">{mr.branch || `${mr.sourceBranch} \u2192 ${mr.targetBranch}`}</span>
+            <span className="mr-branch">{`${mr.sourceBranch} \u2192 ${mr.targetBranch}`}</span>
           </div>
           <div className="mr-meta">
             {mr.unread && <span className="mr-pill new">New</span>}
@@ -221,17 +229,17 @@ function MrCard({ mr, isSelected, onSelect, onContextMenu, onOpenGitLab, onToggl
 // ─── Detail Panel Component ────────────────────────────────────────────────
 function DetailPanel({ mr, closing, onClose, onAnimDone, onToggleUnread, onOpenGitLab, onRemindClick }) {
   const author = getAuthorInfo(mr);
-  const pipeline = mr.pipelineStatus || mr.pipeline;
-  const approvals = mr.approvalsCurrent ?? mr.approvals ?? 0;
-  const needed = mr.approvalsRequired ?? mr.needed ?? 0;
-  const conflicts = mr.hasConflicts ?? mr.conflicts ?? false;
+  const pipeline = mr.pipelineStatus;
+  const approvals = mr.approvalsCurrent ?? 0;
+  const needed = mr.approvalsRequired ?? 0;
+  const conflicts = mr.hasConflicts ?? false;
 
   return (
     <div className={`detail-panel${closing ? " closing" : ""}`} onAnimationEnd={closing ? onAnimDone : undefined} onClick={(e) => e.stopPropagation()}>
       <div className="dp-header">
         <div style={{ flex: 1 }}>
           <div className="dp-title">{mr.title}</div>
-          <div className="dp-branch">{mr.branch || `${mr.sourceBranch} \u2192 ${mr.targetBranch}`}</div>
+          <div className="dp-branch">{`${mr.sourceBranch} \u2192 ${mr.targetBranch}`}</div>
         </div>
         <button className="dp-close" onClick={onClose}>{"\u2715"}</button>
       </div>
@@ -240,7 +248,7 @@ function DetailPanel({ mr, closing, onClose, onAnimDone, onToggleUnread, onOpenG
         <div className="dp-label">Details</div>
         <div className="dp-row"><span className="dp-row-label">Author</span><span className="dp-row-val">{author.name}</span></div>
         <div className="dp-row"><span className="dp-row-label">Your role</span><span className="dp-row-val">{roleLabel(mr.role)}</span></div>
-        <div className="dp-row"><span className="dp-row-label">Pipeline</span><span className="dp-row-val">{pipelineLabel(pipeline) || "—"}</span></div>
+        <div className="dp-row"><span className="dp-row-label">Pipeline</span><span className="dp-row-val">{pipelineLabel(pipeline) || "-"}</span></div>
         <div className="dp-row"><span className="dp-row-label">Approvals</span><span className="dp-row-val">{approvals} / {needed}</span></div>
         <div className="dp-row"><span className="dp-row-label">Conflicts</span><span className="dp-row-val">{conflicts ? "Yes" : "None"}</span></div>
         {mr.reminder && (
@@ -261,7 +269,7 @@ function DetailPanel({ mr, closing, onClose, onAnimDone, onToggleUnread, onOpenG
           {(mr.activity || []).map((a, i) => (
             <div className="activity-item" key={i}>
               <div className="act-dot" style={{ background: a.color }}>
-                {a.who === "sys" ? "\u26A1" : a.who === "you" ? "Y" : a.who.charAt(0).toUpperCase()}
+                {a.who === "sys" ? "\u26A1" : a.who.charAt(0).toUpperCase()}
               </div>
               <div className="act-body">
                 <div className="act-text">{a.text}</div>
@@ -276,16 +284,12 @@ function DetailPanel({ mr, closing, onClose, onAnimDone, onToggleUnread, onOpenG
 }
 
 // ─── Settings View Component ───────────────────────────────────────────────
-function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermission, onNotifPermissionChange, showToast, appVersion }) {
+function SettingsView({ settings, onUpdate, onConnect, onDisconnect, onSavePreferences, notifPermission, onNotifPermissionChange, showToast, appVersion }) {
   const update = (key, value) => onUpdate({ ...settings, [key]: value });
-  const saveField = (key, value) => {
-    const next = { ...settings, [key]: value };
-    onSave(next);
-  };
   const toggle = (key) => {
     const next = { ...settings, [key]: !settings[key] };
     onUpdate(next);
-    onSave(next);
+    onSavePreferences(next);
   };
 
   return (
@@ -314,7 +318,6 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
               value={settings.url}
               placeholder="https://gitlab.example.com"
               onChange={(e) => update("url", e.target.value)}
-              onBlur={(e) => saveField("url", e.target.value)}
             />
             <div className="field-hint">Full URL of your GitLab instance, including https://</div>
           </div>
@@ -330,7 +333,6 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
                 value={settings.token || ""}
                 placeholder="glpat-xxxxxxxxxxxxxxxx"
                 onChange={(e) => update("token", e.target.value)}
-                onBlur={(e) => saveField("token", e.target.value)}
               />
               <button className="dp-btn" style={{ whiteSpace: "nowrap", height: 38 }} onClick={() => update("tokenVisible", !settings.tokenVisible)}>
                 {settings.tokenVisible ? "Hide" : "Show"}
@@ -342,7 +344,10 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
           </div>
 
           <div className="settings-actions">
-            <button className="dp-btn primary" onClick={onTestConnection}>Test connection</button>
+            <button className="dp-btn primary" onClick={onConnect}>Save</button>
+            {settings.connected && (
+              <button className="dp-btn" onClick={onDisconnect}>Disconnect</button>
+            )}
           </div>
         </div>
 
@@ -351,7 +356,7 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
           <div className="settings-card-desc">How often to check for new merge requests and updates</div>
           <div className="field-group">
             <div className="field-label">Check interval</div>
-            <select className="poll-select" value={settings.pollInterval} onChange={(e) => { const next = { ...settings, pollInterval: e.target.value }; onUpdate(next); onSave(next); }}>
+            <select className="poll-select" value={settings.pollInterval} onChange={(e) => { const next = { ...settings, pollInterval: e.target.value }; onUpdate(next); onSavePreferences(next); }}>
               <option value="15">Every 15 seconds</option>
               <option value="30">Every 30 seconds</option>
               <option value="60">Every 1 minute</option>
@@ -374,7 +379,6 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
             { key: "desktopNotif", label: "Desktop notifications", desc: "Show system notifications for new events" },
             { key: "soundNotif", label: "Sound", desc: "Play a sound when a new MR needs attention" },
             { key: "showDrafts", label: "Show drafts", desc: "Include draft merge requests in the feed" },
-            { key: "showMentions", label: "Show mentions", desc: "Include MRs where you are only mentioned" },
           ].map(({ key, label, desc }) => (
             <div className="toggle-row" key={key}>
               <div>
@@ -394,7 +398,7 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
                 if (!invoke) return;
                 invoke("send_test_notification")
                   .then(() => {
-                    showToast("Test notification sent. If you don't see a banner, check Notification Center — macOS hides banners for active apps.");
+                    showToast("Test notification sent. If you don't see a banner, check Notification Center - macOS hides banners for active apps.");
                     invoke("check_notification_permission").then((granted) => onNotifPermissionChange(granted));
                   })
                   .catch(() => showToast("Failed to send test notification"));
@@ -413,7 +417,7 @@ function SettingsView({ settings, onUpdate, onTestConnection, onSave, notifPermi
 
 // ─── Inbox View Component ──────────────────────────────────────────────────
 function InboxView({
-  mergeRequests, projects, selectedProject, selectedRole,
+  mergeRequests, projects, selectedProject, selectedRole, showDrafts,
   selectedMrId, searchQuery, loading, lastChecked, checking,
   closingPanel, onClosePanel, onPanelAnimDone,
   onSelectProject, onSelectRole, onSelectMr,
@@ -422,15 +426,15 @@ function InboxView({
 }) {
   const lastCheckedLabel = useRelativeTime(lastChecked);
   const [listRef] = useAutoAnimate({ duration: 250 });
+  const visible = visibleMergeRequests(mergeRequests, showDrafts);
   const filtered = (() => {
-    let list = mergeRequests;
-    if (selectedProject > 0) list = list.filter((m) => getProjectId(m) === selectedProject);
+    let list = visible;
+    if (selectedProject > 0) list = list.filter((m) => m.projectId === selectedProject);
     if (selectedRole !== "all") list = list.filter((m) => m.role === selectedRole);
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       list = list.filter((m) =>
         m.title.toLowerCase().includes(q) ||
-        (m.branch && m.branch.toLowerCase().includes(q)) ||
         (m.sourceBranch && m.sourceBranch.toLowerCase().includes(q))
       );
     }
@@ -446,13 +450,12 @@ function InboxView({
   })();
 
   const roleCounts = (() => {
-    let list = mergeRequests;
-    if (selectedProject > 0) list = list.filter((m) => getProjectId(m) === selectedProject);
+    let list = visible;
+    if (selectedProject > 0) list = list.filter((m) => m.projectId === selectedProject);
     return {
       all: list.length,
       reviewer: list.filter((m) => m.role === "reviewer").length,
       assignee: list.filter((m) => m.role === "assignee").length,
-      mentioned: list.filter((m) => m.role === "mentioned").length,
     };
   })();
 
@@ -472,7 +475,7 @@ function InboxView({
           >
             <span className={`check-icon${checking || loading ? " spinning" : ""}`}>{"\u21BB"}</span>
             <span className="check-now-text">
-              <span className="check-now-label">{checking || loading ? "Checking\u2026" : "Check Now"}</span>
+              <span className="check-now-label">{checking || loading ? "Checking..." : "Check Now"}</span>
               {lastCheckedLabel && lastCheckedLabel !== "just now" && (
                 <span className="check-now-time">{lastCheckedLabel}</span>
               )}
@@ -483,7 +486,6 @@ function InboxView({
               ["all", "All", roleCounts.all],
               ["reviewer", "Review", roleCounts.reviewer],
               ["assignee", "Assignee", roleCounts.assignee],
-              ["mentioned", "Mentioned", roleCounts.mentioned],
             ].map(([key, label, count]) => (
               <button key={key} className={`seg-btn ${selectedRole === key ? "active" : ""}`} onClick={() => onSelectRole(key)}>
                 {label}{count ? ` \u00B7 ${count}` : ""}
@@ -589,8 +591,9 @@ export default function App() {
     settings,
     loading: settingsLoading,
     updateSettings,
-    saveSettings,
-    testConnection,
+    savePreferences,
+    connect,
+    disconnect,
   } = useSettings(showToast);
 
   const gitlab = useGitlab(showToast);
@@ -598,13 +601,30 @@ export default function App() {
   const mergeRequests = gitlab.mergeRequests;
   const projects = gitlab.projects;
 
-  useEffect(() => {
-    if (settings.connected) {
-      gitlab.fetchData();
-      gitlab.startPolling();
-      return () => { gitlab.stopPolling(); };
+  // the backend owns the polling lifecycle, so connect/disconnect only reset the
+  // view. the previous account's poll task stops only inside connect, after token
+  // validation, so a stale mr-update from it can land between the first
+  // prepareReload and connect resolving. on success clear again - connect has
+  // returned, so the old task is fully stopped and only the new account can emit
+  // now - and reset the account-scoped selection so a stale project filter or MR
+  // id cannot hide or mis-open the new account's list. seedFromCache then shows
+  // the new account if its first poll already cached a payload, or on failure
+  // restores the still-polling previous account's cached data.
+  const handleConnect = useCallback(async () => {
+    gitlab.prepareReload();
+    if (await connect()) {
+      setSelectedProject(0);
+      setSelectedMrId(null);
+      gitlab.prepareReload();
     }
-  }, [settings.connected]);
+    gitlab.seedFromCache();
+  }, [connect, gitlab.prepareReload, gitlab.seedFromCache]);
+
+  const handleDisconnect = useCallback(async () => {
+    if (await disconnect()) {
+      gitlab.prepareReload();
+    }
+  }, [disconnect, gitlab.prepareReload]);
 
   useEffect(() => {
     if (!settingsLoading && !settings.connected) {
@@ -664,7 +684,7 @@ export default function App() {
   }, [gitlab.toggleUnread]);
 
   const closePanel = useCallback(() => {
-    setClosingPanel((prev) => prev || true);
+    setClosingPanel(true);
   }, []);
 
   const onPanelAnimDone = useCallback(() => {
@@ -700,15 +720,20 @@ export default function App() {
   }, []);
 
   const handleRemindClick = useCallback((mrId) => {
-    setCtxMenu({ mrId, x: 400, y: 300 });
+    setCtxMenu({ mrId, x: REMINDER_POPUP_POS.x, y: REMINDER_POPUP_POS.y });
   }, []);
 
   const handleCustomReminder = useCallback((mrId) => {
-    setCustomReminderState({ open: true, mrId, position: { x: 400, y: 200 } });
+    setCustomReminderState({ open: true, mrId, position: CUSTOM_REMINDER_POPUP_POS });
   }, []);
 
+  // hidden drafts must not drive any badge the user cannot see, so every count
+  // (sidebar, per-project, tray) works off the same draft-filtered list the
+  // inbox renders.
+  const visibleMrs = visibleMergeRequests(mergeRequests, settings.showDrafts);
+
   // sync tray badge whenever totalUnread changes
-  const totalUnread = mergeRequests.filter((m) => m.unread).length;
+  const totalUnread = visibleMrs.filter((m) => m.unread).length;
 
   useEffect(() => {
     const invoke = window.__TAURI_INTERNALS__?.invoke;
@@ -731,7 +756,7 @@ export default function App() {
   }, []);
 
   const countForProject = (pid) => {
-    const list = pid > 0 ? mergeRequests.filter((m) => getProjectId(m) === pid) : mergeRequests;
+    const list = pid > 0 ? visibleMrs.filter((m) => m.projectId === pid) : visibleMrs;
     return list.filter((m) => m.unread).length;
   };
 
@@ -799,8 +824,9 @@ export default function App() {
         <SettingsView
           settings={settings}
           onUpdate={updateSettings}
-          onTestConnection={testConnection}
-          onSave={saveSettings}
+          onConnect={handleConnect}
+          onDisconnect={handleDisconnect}
+          onSavePreferences={savePreferences}
           notifPermission={notifPermission}
           onNotifPermissionChange={setNotifPermission}
           showToast={showToast}
@@ -826,6 +852,7 @@ export default function App() {
           projects={projects}
           selectedProject={selectedProject}
           selectedRole={selectedRole}
+          showDrafts={settings.showDrafts}
           selectedMrId={selectedMrId}
           searchQuery={searchQuery}
           loading={gitlab.loading}

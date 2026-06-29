@@ -1,4 +1,4 @@
-/* ─── Meerkat — App.css ────────────────────────────────────────────────── */
+/* ─── Meerkat - App.css ────────────────────────────────────────────────── */
 /* Apple-style design system for Tauri desktop app                          */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -260,7 +260,6 @@ html, body {
 .mr-pill.new { background: var(--accent); color: #fff; font-weight: 600; }
 .mr-pill.reviewer { background: var(--purple); color: #fff; }
 .mr-pill.assignee { background: var(--accent); color: #fff; }
-.mr-pill.mentioned { background: var(--orange); color: #fff; }
 .mr-pill.draft { background: var(--text-tertiary); color: #fff; }
 .mr-pill.conflicts { background: var(--red); color: #fff; }
 .mr-pill.approved { background: var(--green); color: #fff; }

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod commands;
 mod credentials;
 mod models;
@@ -8,7 +6,7 @@ mod polling;
 
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
-use tauri::{Emitter, Listener, Manager};
+use tauri::{Emitter, Manager};
 
 #[cfg(target_os = "macos")]
 static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -17,7 +15,7 @@ static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 pub fn update_tray(handle: &tauri::AppHandle, unread: usize) {
     if let Some(tray) = handle.tray_by_id("main") {
         let title = if unread > 0 {
-            format!("{}", unread)
+            unread.to_string()
         } else {
             String::new()
         };
@@ -93,9 +91,9 @@ pub fn run() {
                             let _ = app.emit("navigate", "settings");
                         }
                         "check_now" => {
-                            let handle = app.clone();
+                            let app = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                let _ = polling::run_check_cycle(&handle, true).await;
+                                polling::check_now(app).await;
                             });
                         }
                         "quit" => {
@@ -104,17 +102,17 @@ pub fn run() {
                         _ => {}
                     });
                 }
+            }
 
-                // update tray on mr-update events
-                let handle2 = app.handle().clone();
-                app.listen("mr-update", move |event: tauri::Event| {
-                    if let Ok(payload) =
-                        serde_json::from_str::<models::MrUpdatePayload>(event.payload())
-                    {
-                        let unread = payload.active.iter().filter(|m| m.unread).count();
-                        update_tray(&handle2, unread);
-                    }
-                });
+            // fold the pre-object identity layout into the single object once, so
+            // every later read is one atomic get.
+            crate::commands::system::migrate_legacy_identity(app.handle());
+
+            // the backend owns the polling lifecycle: start it on launch when an
+            // account is configured, and let connect/disconnect manage it after.
+            if crate::commands::settings::is_connected(app.handle()) {
+                crate::commands::system::migrate_legacy_stores(app.handle());
+                polling::start_polling(app.handle().clone());
             }
 
             Ok(())
@@ -132,10 +130,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::gitlab::test_connection,
-            commands::gitlab::fetch_merge_requests,
+            commands::gitlab::connect,
             commands::settings::get_settings,
-            commands::settings::save_settings,
+            commands::settings::save_preferences,
+            commands::settings::disconnect,
             commands::reminders::set_reminder,
             commands::reminders::clear_reminder,
             commands::system::open_in_browser,
@@ -145,9 +143,8 @@ pub fn run() {
             commands::system::prompt_notification_permission,
             commands::system::send_test_notification,
             commands::system::get_app_version,
-            polling::start_polling,
-            polling::stop_polling,
             polling::check_now,
+            polling::get_last_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 function getTauriInvoke() {
   if (typeof window !== "undefined" && window.__TAURI_INTERNALS__) {
@@ -17,69 +17,68 @@ function getTauriListen() {
 export function useGitlab(showToast) {
   const [mergeRequests, setMergeRequests] = useState([]);
   const [projects, setProjects] = useState([]);
-  const [loading, setLoading] = useState(false);
+  // the backend polls on launch when connected, so start in the loading state
+  // and let the first mr-update (or connection-error) clear it
+  const [loading, setLoading] = useState(true);
   const [offline, setOffline] = useState(false);
   const [lastChecked, setLastChecked] = useState(null);
   const [checking, setChecking] = useState(false);
+  const manualCheckPending = useRef(false);
 
-  const fetchData = useCallback(async () => {
+  // pulls the backend's cached snapshot into the view. used on mount (the first
+  // mr-update may have fired before the listener attached) and after a failed
+  // connect (to restore the still-polling previous account's data).
+  const seedFromCache = useCallback(() => {
     const invoke = getTauriInvoke();
-    if (!invoke) {
-      showToast("Tauri not available. Cannot fetch data.");
-      return;
-    }
-    setLoading(true);
-    try {
-      const payload = await invoke("fetch_merge_requests");
-      setMergeRequests(payload.active);
-      setProjects(payload.projects);
-      setOffline(false);
-      setLastChecked(new Date());
-    } catch (e) {
-      console.error("Fetch error:", e);
-      if (typeof e === "string" && e.includes("TOKEN_EXPIRED")) {
-        showToast("Token expired. Update in Settings.");
-      } else {
-        setOffline(true);
-      }
-    } finally {
-      setLoading(false);
-    }
-  }, [showToast]);
+    if (!invoke) return;
+    invoke("get_last_update")
+      .then((payload) => {
+        if (!payload) return;
+        setMergeRequests(payload.active);
+        setProjects(payload.projects);
+        setOffline(false);
+        setLastChecked(new Date());
+        setLoading(false);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const listenPromise = getTauriListen();
     if (!listenPromise) return;
 
-    let unlistenMr, unlistenErr, unlistenReminders, unlistenCheckStarted, unlistenCheckFinished, unlistenCheckBusy;
+    let unlistenMr, unlistenErr, unlistenReminders;
 
     listenPromise.then((listen) => {
-      listen("check-started", () => {
-        setChecking(true);
-      }).then((fn) => { unlistenCheckStarted = fn; });
-
-      listen("check-finished", (event) => {
-        setChecking(false);
-        if (event.payload) {
-          showToast("Updated just now");
-        }
-      }).then((fn) => { unlistenCheckFinished = fn; });
-
-      listen("check-already-running", () => {
-        showToast("Update already in progress…");
-      }).then((fn) => { unlistenCheckBusy = fn; });
-
       listen("mr-update", (event) => {
         const payload = event.payload;
         setMergeRequests(payload.active);
         setProjects(payload.projects);
         setOffline(false);
         setLastChecked(new Date());
-      }).then((fn) => { unlistenMr = fn; });
+        setLoading(false);
+        setChecking(false);
+        if (manualCheckPending.current) {
+          manualCheckPending.current = false;
+          showToast("Updated just now");
+        }
+      }).then((fn) => {
+        unlistenMr = fn;
+      });
 
       listen("connection-error", (event) => {
-        showToast(`Connection error: ${event.payload}`);
-      }).then((fn) => { unlistenErr = fn; });
+        setLoading(false);
+        setChecking(false);
+        manualCheckPending.current = false;
+        // toast only on the offline transition; polling re-fires this every
+        // interval while the outage lasts and would otherwise spam the user
+        setOffline((wasOffline) => {
+          if (!wasOffline) showToast(`Connection error: ${event.payload}`);
+          return true;
+        });
+      }).then((fn) => {
+        unlistenErr = fn;
+      });
 
       listen("reminders-fired", (event) => {
         const firedIds = event.payload;
@@ -88,36 +87,48 @@ export function useGitlab(showToast) {
             firedIds.includes(m.id) ? { ...m, reminder: null, unread: true } : m,
           ),
         );
-      }).then((fn) => { unlistenReminders = fn; });
+      }).then((fn) => {
+        unlistenReminders = fn;
+      });
+
+      // the backend may have emitted the first mr-update before this listener
+      // attached; pull the cached snapshot so the UI shows data instead of
+      // staying on "Loading..." until the next poll interval.
+      seedFromCache();
     });
 
     return () => {
-      if (unlistenCheckStarted) unlistenCheckStarted();
-      if (unlistenCheckFinished) unlistenCheckFinished();
-      if (unlistenCheckBusy) unlistenCheckBusy();
       if (unlistenMr) unlistenMr();
       if (unlistenErr) unlistenErr();
       if (unlistenReminders) unlistenReminders();
     };
-  }, [showToast]);
+  }, [showToast, seedFromCache]);
 
-  const startPolling = useCallback(async () => {
-    const invoke = getTauriInvoke();
-    if (!invoke) return;
-    try {
-      await invoke("start_polling");
-    } catch (e) {
-      console.error("Failed to start polling:", e);
-    }
+  // clears the view and shows loading while a freshly connected account's first
+  // poll cycle loads. the backend owns starting/stopping polling (on
+  // connect/disconnect and at launch), so the UI only resets its own state here.
+  const prepareReload = useCallback(() => {
+    setMergeRequests([]);
+    setProjects([]);
+    setOffline(false);
+    setLoading(true);
+    // drop any pending manual check so a switch doesn't carry the flag across
+    // accounts and fire a false "Updated just now" on the next account's poll
+    setChecking(false);
+    manualCheckPending.current = false;
   }, []);
 
-  const stopPolling = useCallback(async () => {
+  const checkNow = useCallback(async () => {
     const invoke = getTauriInvoke();
     if (!invoke) return;
+    manualCheckPending.current = true;
+    setChecking(true);
     try {
-      await invoke("stop_polling");
+      await invoke("check_now");
     } catch (e) {
-      console.error("Failed to stop polling:", e);
+      setChecking(false);
+      manualCheckPending.current = false;
+      console.error("Failed to check now:", e);
     }
   }, []);
 
@@ -182,16 +193,6 @@ export function useGitlab(showToast) {
     [showToast],
   );
 
-  const checkNow = useCallback(async () => {
-    const invoke = getTauriInvoke();
-    if (!invoke) return;
-    try {
-      await invoke("check_now");
-    } catch (e) {
-      console.error("Failed to check now:", e);
-    }
-  }, []);
-
   const clearReminder = useCallback(
     async (id) => {
       const invoke = getTauriInvoke();
@@ -219,13 +220,12 @@ export function useGitlab(showToast) {
     loading,
     offline,
     lastChecked,
-    fetchData,
-    startPolling,
-    stopPolling,
+    checking,
+    prepareReload,
+    seedFromCache,
+    checkNow,
     toggleUnread,
     openGitLab,
-    checking,
-    checkNow,
     setReminder,
     clearReminder,
   };

@@ -1,10 +1,17 @@
+use crate::commands::system::{encode_read_state, ReadStateSource, StoredReadState};
 use crate::credentials;
 use crate::models::*;
 use chrono::Utc;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
-use tauri::AppHandle;
-use tauri_plugin_store::StoreExt;
+use tauri::{AppHandle, Wry};
+use tauri_plugin_store::{Store, StoreExt};
+use tokio::time::{sleep, Duration};
+
+// activity-feed colors; ACCENT_COLOR mirrors the frontend `--accent` purple (see
+// ACCENT_COLOR in src/App.jsx) and must be kept in sync across the boundary.
+const ACCENT_COLOR: &str = "#5e5ce6";
+const SYSTEM_EVENT_COLOR: &str = "#34c759";
 
 fn build_client(token: &str) -> Result<Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -15,35 +22,106 @@ fn build_client(token: &str) -> Result<Client, String> {
     );
     Client::builder()
         .default_headers(headers)
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
-fn get_credentials(app: &AppHandle) -> Result<(String, String), String> {
+// statuses that signal a momentary server/proxy hiccup rather than a real
+// failure - safe to retry the same GET
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+// GET with one retry on transient failures (network errors and 408/429/5xx). a
+// single blip would otherwise fail the whole poll and drop the app to offline; a
+// short backoff lets a flaky request recover within the cycle. kept low on
+// purpose - a persistently slow endpoint that 408s should fail fast and let the
+// caller degrade, not stack up multi-minute hangs.
+async fn gitlab_get(client: &Client, url: &str) -> Result<reqwest::Response, String> {
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut attempt = 1;
+    loop {
+        let outcome = client.get(url).send().await;
+        match &outcome {
+            Ok(resp) if is_transient_status(resp.status()) => {
+                log::warn!(
+                    "transient {} from {} (attempt {attempt})",
+                    resp.status(),
+                    url
+                )
+            }
+            Err(e) => log::warn!("request error from {} (attempt {attempt}): {e}", url),
+            _ => {}
+        }
+        match outcome {
+            Ok(resp) if is_transient_status(resp.status()) && attempt < MAX_ATTEMPTS => {}
+            Ok(resp) => return Ok(resp),
+            Err(e) if attempt >= MAX_ATTEMPTS => return Err(format!("API error: {e}")),
+            Err(_) => {}
+        }
+        sleep(Duration::from_millis(500 * attempt as u64)).await;
+        attempt += 1;
+    }
+}
+
+struct Identity {
+    url: String,
+    token: String,
+    user_id: i64,
+    username: String,
+}
+
+// reads the (url, token, user_id, username) identity from settings + keychain.
+// only `connect` writes the identity, and it does so while the poll task is
+// stopped, so a read here never races a half-written identity.
+fn load_identity(app: &AppHandle) -> Result<Identity, String> {
     let store = app
         .store("settings.json")
         .map_err(|e| format!("Store error: {e}"))?;
 
-    let url = store
-        .get("gitlab_url")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
-
+    let stored = crate::commands::system::read_identity(&store);
     let token = credentials::get_token()?.unwrap_or_default();
 
-    if url.is_empty() || token.is_empty() {
+    if stored.url.is_empty() || token.is_empty() {
         return Err("GitLab URL or token not configured".to_string());
     }
 
-    Ok((url, token))
+    let user_id = stored.user_id.ok_or("User ID not found. Connect first.")?;
+
+    Ok(Identity {
+        url: stored.url,
+        token,
+        user_id,
+        username: stored.username,
+    })
 }
 
+fn connect_error_for_status(status: reqwest::StatusCode) -> Option<String> {
+    if status == 401 {
+        Some("Invalid token or token expired".to_string())
+    } else if status == 429 {
+        Some("Rate limited by GitLab. Try again later.".to_string())
+    } else if !status.is_success() {
+        Some(format!("GitLab API error: {status}"))
+    } else {
+        None
+    }
+}
+
+// validates the token against the url, then commits the new identity and
+// restarts polling. validation happens before any write, so a bad token leaves
+// the existing identity untouched. the poll task is stopped (and awaited) before
+// the write and started after, so no cycle ever runs against a half-applied
+// identity or persists the previous account's data after the switch.
 #[tauri::command]
-pub async fn test_connection(
-    app: AppHandle,
-    url: String,
-    token: String,
-) -> Result<UserInfo, String> {
+pub async fn connect(app: AppHandle, url: String, token: String) -> Result<UserInfo, String> {
+    // lock before the GET /user validation, not just before the commit: tokio's
+    // Mutex is fair, so callers commit in request order and the last user action
+    // wins. validating outside the lock would let a slow Save commit a stale
+    // identity after a newer Save/Disconnect already finished (lost-update).
+    let _guard = crate::polling::lock_lifecycle().await;
+
     let client = build_client(&token)?;
     let api_url = format!("{}/api/v4/user", url.trim_end_matches('/'));
 
@@ -53,14 +131,8 @@ pub async fn test_connection(
         .await
         .map_err(|e| format!("Connection failed: {e}"))?;
 
-    if resp.status() == 401 {
-        return Err("Invalid token or token expired".to_string());
-    }
-    if resp.status() == 429 {
-        return Err("Rate limited by GitLab. Try again later.".to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("GitLab API error: {}", resp.status()));
+    if let Some(err) = connect_error_for_status(resp.status()) {
+        return Err(err);
     }
 
     let user: GitLabUser = resp
@@ -68,16 +140,37 @@ pub async fn test_connection(
         .await
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
+    // every fallible read happens before polling stops, so a store or keychain read
+    // error returns with the previous account still polling instead of silently
+    // leaving the app stopped.
     let store = app
         .store("settings.json")
         .map_err(|e| format!("Store error: {e}"))?;
+    let previous = crate::commands::system::read_identity(&store);
+    let previous_token = credentials::get_token()?;
 
-    store.set("gitlab_url", serde_json::json!(url));
-    store.set("user_id", serde_json::json!(user.id));
-    store.set("username", serde_json::json!(user.username));
-    store.save().map_err(|e| format!("Save error: {e}"))?;
+    // wait for the previous account's task to fully unwind before touching the
+    // identity: abort alone only schedules cancellation, so an in-flight cycle
+    // could otherwise persist into the new account's store after the swap.
+    crate::polling::stop_polling().await;
 
-    credentials::store_token(&token)?;
+    if let Err(e) = commit_identity(&store, &url, &user, &token) {
+        crate::commands::settings::restore_identity(
+            &app,
+            &store,
+            &previous,
+            previous_token.as_deref(),
+        );
+        return Err(e);
+    }
+
+    // the new account reads its own per-account stores, so only the in-memory
+    // snapshot must be cleared. legacy un-namespaced data is migrated at startup
+    // against the account present at upgrade - not here, where the connecting
+    // account may differ from the legacy data's owner and would inherit it.
+    crate::polling::reset_previous_mrs();
+
+    crate::polling::start_polling(app);
 
     Ok(UserInfo {
         id: user.id,
@@ -85,6 +178,29 @@ pub async fn test_connection(
         name: user.name,
         avatar_url: user.avatar_url,
     })
+}
+
+// persists the validated identity and token across two stores that cannot be
+// written atomically. a write-ahead marker bridges the gap: the new identity is
+// written with token_committed=false and flushed first, then the keychain token,
+// then token_committed=true. a crash in the keychain-write window leaves the
+// marker false, and startup (is_connected) refuses to poll until the next Save -
+// so a stale-token/identity mix can never silently poll a wrong account (e.g. a
+// same-host account switch where the old token would not 401 under the new
+// user_id filter). any failure is recoverable by restore_identity, which restores
+// the previous account fully (marker included) before resuming its polling.
+fn commit_identity(
+    store: &Store<Wry>,
+    url: &str,
+    user: &GitLabUser,
+    token: &str,
+) -> Result<(), String> {
+    crate::commands::system::write_identity(store, url, Some(user.id), &user.username);
+    crate::commands::system::set_token_committed(store, false);
+    store.save().map_err(|e| format!("Save error: {e}"))?;
+    credentials::store_token(token)?;
+    crate::commands::system::set_token_committed(store, true);
+    store.save().map_err(|e| format!("Save error: {e}"))
 }
 
 async fn fetch_mrs_by_scope(
@@ -102,17 +218,17 @@ async fn fetch_mrs_by_scope(
             base_url, param, uid, page
         );
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("API error: {e}"))?;
+        let resp = gitlab_get(client, &url).await?;
 
         if !resp.status().is_success() {
             if resp.status() == 401 {
                 return Err("TOKEN_EXPIRED".to_string());
             }
-            break;
+            // a persistent non-success here must fail the cycle, not return a
+            // truncated list: treating an outage as success would overwrite the
+            // snapshot with an empty set, clear the UI, and fire a notification
+            // storm once the endpoint recovers
+            return Err(format!("GitLab API error: {}", resp.status()));
         }
 
         let next_page = resp
@@ -138,79 +254,34 @@ async fn fetch_mrs_by_scope(
     Ok(all)
 }
 
-async fn fetch_mentioned_mrs(
-    client: &Client,
-    base_url: &str,
-    username: &str,
-    uid: i64,
-) -> Result<Vec<GitLabMr>, String> {
-    let mut all = Vec::new();
-    let mut page = 1u32;
-
-    loop {
-        let url = format!(
-            "{}/api/v4/merge_requests?scope=all&state=opened&per_page=100&page={}&search=@{}",
-            base_url, page, username
-        );
-
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("API error: {e}"))?;
-
-        if !resp.status().is_success() {
-            break;
-        }
-
-        let next_page = resp
-            .headers()
-            .get("x-next-page")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u32>().ok());
-
-        let mrs: Vec<GitLabMr> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
-
-        if mrs.is_empty() {
-            break;
-        }
-
-        // only keep MRs not authored by the user
-        for mr in mrs {
-            if mr.author.id != uid {
-                all.push(mr);
-            }
-        }
-
-        match next_page {
-            Some(np) if np > page => page = np,
-            _ => break,
-        }
-    }
-
-    Ok(all)
-}
-
+// Err distinguishes a failed fetch from Ok(None) "no pipeline". the caller
+// carries forward the previous status on Err: collapsing a transient failure to
+// None would make an already-failing pipeline read Fail -> None -> Fail across
+// polls and fire a duplicate pipeline-failed notification on recovery.
 async fn fetch_pipeline_status(
     client: &Client,
     base_url: &str,
     project_id: i64,
     mr_iid: i64,
-) -> Option<PipelineStatus> {
+) -> Result<Option<PipelineStatus>, String> {
     let url = format!(
         "{}/api/v4/projects/{}/merge_requests/{}/pipelines?per_page=1",
         base_url, project_id, mr_iid
     );
 
-    let resp = client.get(&url).send().await.ok()?;
-    let pipelines: Vec<GitLabPipeline> = resp.json().await.ok()?;
+    let resp = gitlab_get(client, &url).await?;
+    if !resp.status().is_success() {
+        return Err(format!("GitLab API error: {}", resp.status()));
+    }
+    let pipelines: Vec<GitLabPipeline> =
+        resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
-    pipelines.first().map(|p| match p.status.as_str() {
+    Ok(pipelines.first().map(|p| match p.status.as_str() {
         "success" => PipelineStatus::Pass,
         "failed" => PipelineStatus::Fail,
         "running" => PipelineStatus::Running,
         _ => PipelineStatus::Pending,
-    })
+    }))
 }
 
 struct ApprovalInfo {
@@ -231,7 +302,7 @@ async fn fetch_approvals(
         base_url, project_id, mr_iid
     );
 
-    let resp = match client.get(&url).send().await {
+    let resp = match gitlab_get(client, &url).await {
         Ok(r) => r,
         Err(_) => {
             return ApprovalInfo {
@@ -280,7 +351,7 @@ async fn fetch_reviewer_states(
             base_url, project_id, mr_iid, page
         );
 
-        let resp = match client.get(&url).send().await {
+        let resp = match gitlab_get(client, &url).await {
             Ok(r) => r,
             Err(_) => break,
         };
@@ -321,6 +392,7 @@ fn me_requested_changes(reviewers: &[GitLabReviewerState], current_uid: i64) -> 
         .any(|r| r.user.id == current_uid && r.state.as_deref() == Some("requested_changes"))
 }
 
+#[derive(Clone)]
 struct ReviewRequest {
     todo_id: i64,
     by: String,
@@ -332,7 +404,7 @@ struct ReviewRequest {
 async fn fetch_review_request_todos(
     client: &Client,
     base_url: &str,
-) -> HashMap<i64, ReviewRequest> {
+) -> Result<HashMap<i64, ReviewRequest>, String> {
     let mut map = HashMap::new();
     let mut page = 1u32;
 
@@ -342,13 +414,16 @@ async fn fetch_review_request_todos(
             base_url, page
         );
 
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => break,
-        };
+        let resp = gitlab_get(client, &url).await?;
 
         if !resp.status().is_success() {
-            break;
+            if resp.status() == 401 {
+                return Err("TOKEN_EXPIRED".to_string());
+            }
+            // distinguish a failed fetch from "no pending todos": on an empty map
+            // a still-pending re-request would flip the MR read and then re-notify
+            // once the endpoint recovers, so fail the cycle instead
+            return Err(format!("GitLab API error: {}", resp.status()));
         }
 
         let next_page = resp
@@ -357,10 +432,7 @@ async fn fetch_review_request_todos(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
 
-        let todos: Vec<GitLabTodo> = match resp.json().await {
-            Ok(t) => t,
-            Err(_) => break,
-        };
+        let todos: Vec<GitLabTodo> = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         if todos.is_empty() {
             break;
@@ -384,7 +456,7 @@ async fn fetch_review_request_todos(
         }
     }
 
-    map
+    Ok(map)
 }
 
 async fn fetch_notes(
@@ -392,18 +464,17 @@ async fn fetch_notes(
     base_url: &str,
     project_id: i64,
     mr_iid: i64,
-) -> Vec<GitLabNote> {
+) -> Option<Vec<GitLabNote>> {
     let url = format!(
         "{}/api/v4/projects/{}/merge_requests/{}/notes?sort=desc&per_page=50",
         base_url, project_id, mr_iid
     );
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    resp.json().await.unwrap_or_default()
+    let resp = gitlab_get(client, &url).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
 }
 
 async fn fetch_project_info(
@@ -412,39 +483,40 @@ async fn fetch_project_info(
     project_id: i64,
 ) -> Option<GitLabProject> {
     let url = format!("{}/api/v4/projects/{}", base_url, project_id);
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = gitlab_get(client, &url).await.ok()?;
     resp.json().await.ok()
 }
 
-fn determine_role(mr: &GitLabMr, uid: i64, username: &str, notes: &[GitLabNote]) -> UserRole {
-    if mr
-        .reviewers
-        .as_ref()
-        .is_some_and(|r| r.iter().any(|u| u.id == uid))
-    {
-        return UserRole::Reviewer;
-    }
+fn determine_role(mr: &GitLabMr, uid: i64) -> UserRole {
     if mr
         .assignees
         .as_ref()
         .is_some_and(|a| a.iter().any(|u| u.id == uid))
+        && !mr
+            .reviewers
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|u| u.id == uid))
     {
         return UserRole::Assignee;
     }
-    let mention_tag = format!("@{}", username);
-    if notes.iter().any(|n| n.body.contains(&mention_tag)) {
-        return UserRole::Mentioned;
-    }
-    // came from reviewer/assignee query but user isn't listed — fallback
-    UserRole::Mentioned
+    // came from the reviewer or assignee scope query; default to reviewer when the
+    // listed reviewers/assignees don't include the user (incomplete list payload)
+    UserRole::Reviewer
 }
 
-fn determine_status(mr: &GitLabMr, approvals_current: u32, approvals_required: u32) -> MrStatus {
+fn determine_status(
+    mr: &GitLabMr,
+    approvals_current: u32,
+    approvals_required: u32,
+    i_requested_changes: bool,
+) -> MrStatus {
     match mr.state.as_str() {
         "merged" => MrStatus::Merged,
         "closed" => MrStatus::Closed,
         _ => {
-            if approvals_required > 0 && approvals_current >= approvals_required {
+            if i_requested_changes {
+                MrStatus::Changes
+            } else if approvals_required > 0 && approvals_current >= approvals_required {
                 MrStatus::Approved
             } else {
                 MrStatus::Open
@@ -455,7 +527,14 @@ fn determine_status(mr: &GitLabMr, approvals_current: u32, approvals_required: u
 
 fn color_for_project(index: usize) -> &'static str {
     const COLORS: &[&str] = &[
-        "#5e5ce6", "#ff6482", "#30d158", "#ff9f0a", "#0a84ff", "#af52de", "#ff375f", "#64d2ff",
+        ACCENT_COLOR,
+        "#ff6482",
+        "#30d158",
+        "#ff9f0a",
+        "#0a84ff",
+        "#af52de",
+        "#ff375f",
+        "#64d2ff",
     ];
     COLORS[index % COLORS.len()]
 }
@@ -474,8 +553,8 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
     events.push(ActivityEvent {
         who: mr.author.username.clone(),
         text: format!("{} opened merge request", mr.author.name),
-        time: mr.updated_at.clone(),
-        color: "#5e5ce6".to_string(),
+        time: mr.created_at.clone(),
+        color: ACCENT_COLOR.to_string(),
     });
 
     for note in notes.iter().take(20).rev() {
@@ -493,9 +572,9 @@ fn notes_to_activity(notes: &[GitLabNote], mr: &GitLabMr) -> Vec<ActivityEvent> 
             },
             time: note.created_at.clone(),
             color: if is_system {
-                "#34c759".to_string()
+                SYSTEM_EVENT_COLOR.to_string()
             } else {
-                "#5e5ce6".to_string()
+                ACCENT_COLOR.to_string()
             },
         });
     }
@@ -533,38 +612,16 @@ fn find_latest_comment_from_others(
             break;
         }
         if note.author.username == current_username {
-            // I acted more recently than any other comment here — up to date
+            // I acted more recently than any other comment here - up to date
             return None;
         }
         if !note.system.unwrap_or(false) {
             return Some(note.author.name.clone());
         }
-        // a system note from someone else (push, label) — not a comment, keep
+        // a system note from someone else (push, label) - not a comment, keep
         // scanning older notes for an actual message
     }
     None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ReadStateSource {
-    User,
-    Auto,
-}
-
-impl ReadStateSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            ReadStateSource::User => "user",
-            ReadStateSource::Auto => "auto",
-        }
-    }
-
-    fn from_stored(s: &str) -> Self {
-        match s {
-            "user" => ReadStateSource::User,
-            _ => ReadStateSource::Auto,
-        }
-    }
 }
 
 struct ReadStatus {
@@ -578,44 +635,6 @@ struct ReadSignals {
     approved_by_me: bool,
     i_requested_changes: bool,
     review_request_todo_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum StoredReadState {
-    Full {
-        unread: bool,
-        updated_at: String,
-        source: ReadStateSource,
-        review_request_todo_id: Option<i64>,
-    },
-    LegacyBool(bool),
-}
-
-fn parse_stored_read_state(val: &serde_json::Value) -> Option<StoredReadState> {
-    if let Some(obj) = val.as_object() {
-        let unread = obj.get("unread").and_then(|v| v.as_bool()).unwrap_or(true);
-        let updated_at = obj
-            .get("updatedAt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let source = obj
-            .get("source")
-            .and_then(|v| v.as_str())
-            .map(ReadStateSource::from_stored)
-            .unwrap_or(ReadStateSource::Auto);
-        let review_request_todo_id = obj.get("reviewRequestTodoId").and_then(|v| v.as_i64());
-        return Some(StoredReadState::Full {
-            unread,
-            updated_at,
-            source,
-            review_request_todo_id,
-        });
-    }
-    if let Some(b) = val.as_bool() {
-        return Some(StoredReadState::LegacyBool(b));
-    }
-    None
 }
 
 fn decide_unread_status(
@@ -658,7 +677,7 @@ fn decide_unread_status(
         }
     }
 
-    // 2. a re-request review is pending for me — unread. sits above approval
+    // 2. a re-request review is pending for me - unread. sits above approval
     // because a re-request means the author wants another look even if a stale
     // approval is still on record. notification is driven separately by the
     // todo id (re-request leaves no note and doesn't move updated_at).
@@ -670,7 +689,7 @@ fn decide_unread_status(
         };
     }
 
-    // 3. someone else left a real comment since I last looked — unread + notify,
+    // 3. someone else left a real comment since I last looked - unread + notify,
     // even if I have approved. approval should silence CI/push noise, not a human
     // message; pushes are handled below because GitLab resets my approval on push.
     if let Some(stored_ts) = stored_updated {
@@ -686,7 +705,7 @@ fn decide_unread_status(
         }
     }
 
-    // 4. active approval from me — auto-read (GitLab resets approval on push,
+    // 4. active approval from me - auto-read (GitLab resets approval on push,
     // so the next "real" activity will fall through to step 5 naturally)
     if signals.approved_by_me {
         return ReadStatus {
@@ -696,7 +715,7 @@ fn decide_unread_status(
         };
     }
 
-    // 5. MR changed since last fetch and someone else acted — auto-unread
+    // 5. MR changed since last fetch and someone else acted - auto-unread
     if let Some(stored_ts) = stored_updated {
         if stored_ts != updated_at {
             let latest_actor = find_latest_activity_from_others(notes, current_username, stored_ts);
@@ -710,7 +729,7 @@ fn decide_unread_status(
         }
     }
 
-    // 6. I left a "request changes" review — auto-read. Sits below activity-from-others
+    // 6. I left a "request changes" review - auto-read. Sits below activity-from-others
     // so any reaction from the author (push, comment) flips it back to unread for the
     // next round of the fix cycle.
     if signals.i_requested_changes {
@@ -721,7 +740,7 @@ fn decide_unread_status(
         };
     }
 
-    // 7. fallback — keep stored, default to unread for new MRs
+    // 7. fallback - keep stored, default to unread for new MRs
     ReadStatus {
         unread: stored_unread.unwrap_or(true),
         latest_actor: None,
@@ -737,13 +756,17 @@ fn resolve_unread_status(
     current_username: &str,
     signals: ReadSignals,
 ) -> ReadStatus {
-    let read_store = app.store(crate::commands::system::READ_STATE_STORE).ok();
+    let read_store = crate::commands::system::account_store_name(
+        app,
+        crate::commands::system::READ_STATE_PREFIX,
+    )
+    .and_then(|name| app.store(name).ok());
     let key = mr_id.to_string();
     let stored = read_store
         .as_ref()
         .and_then(|s| s.get(&key))
         .as_ref()
-        .and_then(parse_stored_read_state);
+        .and_then(StoredReadState::parse);
     decide_unread_status(
         stored.as_ref(),
         updated_at,
@@ -754,13 +777,13 @@ fn resolve_unread_status(
 }
 
 fn resolve_reminder(app: &AppHandle, mr_id: i64) -> Option<String> {
-    let store = app.store("reminders.json").ok()?;
-    let key = mr_id.to_string();
-    let val = store.get(&key)?;
-    if let Some(obj) = val.as_object() {
-        return obj.get("label").and_then(|v| v.as_str()).map(String::from);
-    }
-    val.as_str().map(String::from)
+    let name = crate::commands::system::account_store_name(
+        app,
+        crate::commands::reminders::REMINDERS_PREFIX,
+    )?;
+    let store = app.store(name).ok()?;
+    let val = store.get(mr_id.to_string())?;
+    crate::commands::reminders::reminder_field(&val, "label")
 }
 
 fn persist_read_state(
@@ -771,94 +794,48 @@ fn persist_read_state(
     source: ReadStateSource,
     review_request_todo_id: Option<i64>,
 ) {
-    if let Ok(store) = app.store(crate::commands::system::READ_STATE_STORE) {
+    let Some(name) = crate::commands::system::account_store_name(
+        app,
+        crate::commands::system::READ_STATE_PREFIX,
+    ) else {
+        return;
+    };
+    if let Ok(store) = app.store(name) {
         store.set(
             mr_id.to_string(),
-            serde_json::json!({
-                "unread": unread,
-                "updatedAt": updated_at,
-                "source": source.as_str(),
-                "reviewRequestTodoId": review_request_todo_id,
-            }),
+            encode_read_state(unread, updated_at, source, review_request_todo_id),
         );
         let _ = store.save();
     }
 }
 
-#[tauri::command]
-pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, String> {
-    let (base_url, token) = get_credentials(&app)?;
-    let base_url = base_url.trim_end_matches('/').to_string();
-    let client = build_client(&token)?;
-
-    let store = app
-        .store("settings.json")
-        .map_err(|e| format!("Store error: {e}"))?;
-
-    let uid = store
-        .get("user_id")
-        .and_then(|v| v.as_i64())
-        .ok_or("User ID not found. Test connection first.")?;
-
-    let username = store
-        .get("username")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
-
-    let show_mentions = store
-        .get("show_mentions")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    // Fetch MRs by reviewer, assignee, and mentions in parallel
-    let (reviewer_mrs, assignee_mrs, mentioned_mrs) = tokio::join!(
-        fetch_mrs_by_scope(&client, &base_url, "reviewer_id", uid),
-        fetch_mrs_by_scope(&client, &base_url, "assignee_id", uid),
-        async {
-            if show_mentions && !username.is_empty() {
-                fetch_mentioned_mrs(&client, &base_url, &username, uid).await
-            } else {
-                Ok(Vec::new())
-            }
-        },
-    );
-
-    let reviewer_mrs = reviewer_mrs?;
-    let assignee_mrs = assignee_mrs?;
-    let mentioned_mrs = mentioned_mrs.unwrap_or_default();
-
-    // Deduplicate
+fn dedup_by_id(mrs: impl IntoIterator<Item = GitLabMr>) -> Vec<GitLabMr> {
     let mut seen = HashSet::new();
-    let mut all_gitlab_mrs = Vec::new();
+    mrs.into_iter().filter(|mr| seen.insert(mr.id)).collect()
+}
 
-    for mr in reviewer_mrs
-        .into_iter()
-        .chain(assignee_mrs)
-        .chain(mentioned_mrs)
-    {
-        if seen.insert(mr.id) {
-            all_gitlab_mrs.push(mr);
+async fn fetch_project_cache(
+    client: &Client,
+    base_url: &str,
+    mrs: &[GitLabMr],
+) -> HashMap<i64, GitLabProject> {
+    let project_ids: HashSet<i64> = mrs.iter().map(|m| m.project_id).collect();
+    let mut cache = HashMap::new();
+    for pid in project_ids {
+        if let Some(proj) = fetch_project_info(client, base_url, pid).await {
+            cache.insert(pid, proj);
         }
     }
+    cache
+}
 
-    // Fetch project info and cache
-    let mut project_cache: HashMap<i64, GitLabProject> = HashMap::new();
-    let project_ids: Vec<i64> = all_gitlab_mrs
-        .iter()
-        .map(|m| m.project_id)
-        .collect::<HashSet<_>>()
+fn build_projects(project_cache: &HashMap<i64, GitLabProject>) -> Vec<Project> {
+    // sort before assigning colors: HashMap iteration order is nondeterministic,
+    // so coloring by iteration index would shuffle project colors between runs
+    let mut entries: Vec<(&i64, &GitLabProject)> = project_cache.iter().collect();
+    entries.sort_by(|a, b| a.1.name.cmp(&b.1.name).then(a.0.cmp(b.0)));
+    entries
         .into_iter()
-        .collect();
-
-    for pid in &project_ids {
-        if let Some(proj) = fetch_project_info(&client, &base_url, *pid).await {
-            project_cache.insert(*pid, proj);
-        }
-    }
-
-    // Build projects list
-    let mut projects: Vec<Project> = project_cache
-        .iter()
         .enumerate()
         .map(|(i, (id, proj))| Project {
             id: *id,
@@ -867,93 +844,165 @@ pub async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, Str
             color: color_for_project(i).to_string(),
             initials: make_initials(&proj.name),
         })
-        .collect();
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
+        .collect()
+}
 
-    let review_request_todos = fetch_review_request_todos(&client, &base_url).await;
+#[allow(clippy::too_many_arguments)]
+async fn build_merge_request(
+    app: &AppHandle,
+    client: &Client,
+    base_url: &str,
+    uid: i64,
+    username: &str,
+    gl_mr: &GitLabMr,
+    project_cache: &HashMap<i64, GitLabProject>,
+    review_request: Option<ReviewRequest>,
+) -> MergeRequest {
+    let review_request = review_request.as_ref();
+    let fetched_notes = fetch_notes(client, base_url, gl_mr.project_id, gl_mr.iid).await;
+    let notes_ok = fetched_notes.is_some();
+    let notes = fetched_notes.unwrap_or_default();
+    let approval_info = fetch_approvals(client, base_url, gl_mr.project_id, gl_mr.iid, uid).await;
+    let pipeline = fetch_pipeline_status(client, base_url, gl_mr.project_id, gl_mr.iid)
+        .await
+        .unwrap_or_else(|_| crate::polling::previous_mr_pipeline_status(gl_mr.id));
+    let reviewer_states =
+        fetch_reviewer_states(client, base_url, gl_mr.project_id, gl_mr.iid).await;
+    let requested_changes = me_requested_changes(&reviewer_states, uid);
+    let role = determine_role(gl_mr, uid);
+    let status = determine_status(
+        gl_mr,
+        approval_info.current,
+        approval_info.required,
+        requested_changes,
+    );
+    let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
 
-    // Build MRs with details
-    let mut active = Vec::new();
+    let proj = project_cache.get(&gl_mr.project_id);
+    let project_name = proj.map(|p| p.name.clone()).unwrap_or_default();
+    let project_namespace = proj.map(|p| p.namespace.name.clone()).unwrap_or_default();
 
-    for gl_mr in &all_gitlab_mrs {
-        let review_request = review_request_todos.get(&gl_mr.id);
-        let notes = fetch_notes(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
-        let approval_info =
-            fetch_approvals(&client, &base_url, gl_mr.project_id, gl_mr.iid, uid).await;
-        let pipeline = fetch_pipeline_status(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
-        let reviewer_states =
-            fetch_reviewer_states(&client, &base_url, gl_mr.project_id, gl_mr.iid).await;
-        let requested_changes = me_requested_changes(&reviewer_states, uid);
-        let role = determine_role(gl_mr, uid, &username, &notes);
-        let status = determine_status(gl_mr, approval_info.current, approval_info.required);
-        let is_draft = gl_mr.draft.unwrap_or(false) || gl_mr.work_in_progress.unwrap_or(false);
+    let activity = notes_to_activity(&notes, gl_mr);
 
-        let proj = project_cache.get(&gl_mr.project_id);
-        let project_name = proj.map(|p| p.name.clone()).unwrap_or_default();
-        let project_namespace = proj.map(|p| p.namespace.name.clone()).unwrap_or_default();
+    let read_status = resolve_unread_status(
+        app,
+        gl_mr.id,
+        &gl_mr.updated_at,
+        &notes,
+        username,
+        ReadSignals {
+            approved_by_me: approval_info.approved_by_me,
+            i_requested_changes: requested_changes,
+            review_request_todo_id: review_request.map(|r| r.todo_id),
+        },
+    );
+    let reminder = resolve_reminder(app, gl_mr.id);
 
-        let activity = notes_to_activity(&notes, gl_mr);
+    // when notes failed, carry forward the previous snapshot's updated_at so the
+    // snapshot does not advance past the undetected change: keeping the new
+    // updated_at would make compute_notifications see it as unchanged on recovery
+    // and never fire the missed comment. fall back to the new value only when
+    // there is no previous snapshot (a brand-new MR notifies via NewMr anyway)
+    let updated_at_raw = if notes_ok {
+        gl_mr.updated_at.clone()
+    } else {
+        crate::polling::previous_mr_updated_at_raw(gl_mr.id)
+            .unwrap_or_else(|| gl_mr.updated_at.clone())
+    };
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
 
-        let read_status = resolve_unread_status(
-            &app,
-            gl_mr.id,
-            &gl_mr.updated_at,
-            &notes,
-            &username,
-            ReadSignals {
-                approved_by_me: approval_info.approved_by_me,
-                i_requested_changes: requested_changes,
-                review_request_todo_id: review_request.map(|r| r.todo_id),
-            },
-        );
-        let reminder = resolve_reminder(&app, gl_mr.id);
-
-        let updated_at = chrono::DateTime::parse_from_rfc3339(&gl_mr.updated_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-
+    // skip persisting when notes could not be fetched: advancing the anchor to
+    // the new updated_at would permanently swallow an unseen comment
+    if notes_ok {
         persist_read_state(
-            &app,
+            app,
             gl_mr.id,
             read_status.unread,
             &gl_mr.updated_at,
             read_status.source,
             review_request.map(|r| r.todo_id),
         );
+    }
 
-        let mr = MergeRequest {
-            id: gl_mr.id,
-            iid: gl_mr.iid,
-            project_id: gl_mr.project_id,
-            project_name,
-            project_namespace,
-            title: gl_mr.title.clone(),
-            source_branch: gl_mr.source_branch.clone(),
-            target_branch: gl_mr.target_branch.clone(),
-            author_name: gl_mr.author.name.clone(),
-            author_username: gl_mr.author.username.clone(),
-            role,
-            status: status.clone(),
-            draft: is_draft,
-            has_conflicts: gl_mr.has_conflicts.unwrap_or(false),
-            pipeline_status: pipeline,
-            approvals_current: approval_info.current,
-            approvals_required: approval_info.required,
-            web_url: gl_mr.web_url.clone(),
-            updated_at,
-            unread: read_status.unread,
-            reminder,
-            activity,
-            latest_actor: read_status.latest_actor,
-            updated_at_raw: gl_mr.updated_at.clone(),
-            review_request_todo_id: review_request.map(|r| r.todo_id),
-            review_request_by: review_request.map(|r| r.by.clone()),
+    MergeRequest {
+        id: gl_mr.id,
+        iid: gl_mr.iid,
+        project_id: gl_mr.project_id,
+        project_name,
+        project_namespace,
+        title: gl_mr.title.clone(),
+        source_branch: gl_mr.source_branch.clone(),
+        target_branch: gl_mr.target_branch.clone(),
+        author_name: gl_mr.author.name.clone(),
+        author_username: gl_mr.author.username.clone(),
+        role,
+        status,
+        draft: is_draft,
+        has_conflicts: gl_mr.has_conflicts.unwrap_or(false),
+        pipeline_status: pipeline,
+        approvals_current: approval_info.current,
+        approvals_required: approval_info.required,
+        web_url: gl_mr.web_url.clone(),
+        updated_at,
+        unread: read_status.unread,
+        reminder,
+        activity,
+        latest_actor: read_status.latest_actor,
+        updated_at_raw,
+        review_request_todo_id: review_request.map(|r| r.todo_id),
+        review_request_by: review_request.map(|r| r.by.clone()),
+    }
+}
+
+pub(crate) async fn fetch_merge_requests(app: AppHandle) -> Result<MrUpdatePayload, String> {
+    let identity = load_identity(&app)?;
+    let base_url = identity.url.trim_end_matches('/').to_string();
+    let client = build_client(&identity.token)?;
+    let uid = identity.user_id;
+    let username = identity.username;
+
+    let (reviewer_mrs, assignee_mrs) = tokio::join!(
+        fetch_mrs_by_scope(&client, &base_url, "reviewer_id", uid),
+        fetch_mrs_by_scope(&client, &base_url, "assignee_id", uid),
+    );
+
+    let all_gitlab_mrs = dedup_by_id(reviewer_mrs?.into_iter().chain(assignee_mrs?));
+
+    let project_cache = fetch_project_cache(&client, &base_url, &all_gitlab_mrs).await;
+    let projects = build_projects(&project_cache);
+
+    // a failed todos fetch must not take the whole app offline: re-request
+    // detection is best-effort. on failure carry each MR's previous re-request
+    // forward so a transient outage neither drops it nor re-fires the
+    // notification once the endpoint recovers
+    let review_request_todos = fetch_review_request_todos(&client, &base_url).await;
+    let todos_ok = review_request_todos.is_ok();
+    let review_request_todos = review_request_todos.unwrap_or_default();
+
+    let mut active = Vec::new();
+    for gl_mr in &all_gitlab_mrs {
+        let review_request = if todos_ok {
+            review_request_todos.get(&gl_mr.id).cloned()
+        } else {
+            crate::polling::previous_mr_review_request(gl_mr.id)
+                .map(|(todo_id, by)| ReviewRequest { todo_id, by })
         };
-
+        let mr = build_merge_request(
+            &app,
+            &client,
+            &base_url,
+            uid,
+            &username,
+            gl_mr,
+            &project_cache,
+            review_request,
+        )
+        .await;
         active.push(mr);
     }
 
-    // Sort by updated_at desc
     active.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
 
     Ok(MrUpdatePayload { active, projects })
@@ -970,7 +1019,6 @@ mod tests {
 
     fn note(username: &str, created_at: &str) -> GitLabNote {
         GitLabNote {
-            id: 1,
             body: String::new(),
             author: GitLabUser {
                 id: 1,
@@ -980,7 +1028,6 @@ mod tests {
             },
             created_at: created_at.to_string(),
             system: None,
-            noteable_type: None,
         }
     }
 
@@ -1092,8 +1139,32 @@ mod tests {
             work_in_progress: None,
             has_conflicts: None,
             web_url: String::new(),
+            created_at: T1.to_string(),
             updated_at: T3.to_string(),
             project_id: 1,
+        }
+    }
+
+    fn gl_user(id: i64, username: &str) -> GitLabUser {
+        GitLabUser {
+            id,
+            username: username.to_string(),
+            name: format!("Name {username}"),
+            avatar_url: String::new(),
+        }
+    }
+
+    fn gl_mr_roles(
+        reviewers: Option<Vec<GitLabUser>>,
+        assignees: Option<Vec<GitLabUser>>,
+        state: &str,
+    ) -> GitLabMr {
+        GitLabMr {
+            reviewers,
+            assignees,
+            state: state.to_string(),
+            updated_at: T1.to_string(),
+            ..gl_mr()
         }
     }
 
@@ -1134,8 +1205,7 @@ mod tests {
 
     #[test]
     fn find_latest_activity_from_others_returns_none_when_my_note_is_newest() {
-        // arrange — my own comment is the latest activity: nothing to attribute to
-        // others, otherwise my comment would notify me naming whoever spoke before me
+        // arrange
         let notes = vec![note(ME, T3), note("alice", T2)];
 
         // act
@@ -1159,7 +1229,7 @@ mod tests {
 
     #[test]
     fn find_latest_activity_from_others_picks_most_recent_when_multiple_others() {
-        // arrange — first note in desc-sorted list is the newest
+        // arrange
         let newest_other = note("alice", T3);
         let older_other = note("bob", T2);
         let notes = vec![newest_other.clone(), older_other];
@@ -1187,7 +1257,7 @@ mod tests {
 
     #[test]
     fn find_latest_comment_skips_others_system_note_for_older_comment() {
-        // arrange — a push (system) on top of a real comment still surfaces the comment
+        // arrange
         let comment = note("alice", T2);
         let notes = vec![system_note("alice", T3), comment.clone()];
 
@@ -1212,7 +1282,7 @@ mod tests {
 
     #[test]
     fn find_latest_comment_returns_none_when_my_action_is_newest() {
-        // arrange — my approval (system, mine) on top of others' comment — I'm up to date
+        // arrange
         let notes = vec![system_note(ME, T3), note("alice", T2)];
 
         // act
@@ -1232,99 +1302,6 @@ mod tests {
 
         // assert
         assert!(actor.is_none());
-    }
-
-    // --- parse_stored_read_state ---
-
-    #[test]
-    fn parse_full_object_extracts_all_fields() {
-        // arrange
-        let val = serde_json::json!({
-            "unread": false,
-            "updatedAt": T1,
-            "source": "user",
-        });
-
-        // act
-        let parsed = parse_stored_read_state(&val);
-
-        // assert
-        assert_eq!(parsed, Some(full(false, T1, ReadStateSource::User)));
-    }
-
-    #[test]
-    fn parse_full_object_extracts_review_request_todo_id() {
-        // arrange
-        let val = serde_json::json!({
-            "unread": false,
-            "updatedAt": T1,
-            "source": "user",
-            "reviewRequestTodoId": 42,
-        });
-
-        // act
-        let parsed = parse_stored_read_state(&val);
-
-        // assert
-        assert_eq!(
-            parsed,
-            Some(full_todo(false, T1, ReadStateSource::User, Some(42)))
-        );
-    }
-
-    #[test]
-    fn parse_object_missing_source_defaults_to_auto() {
-        // arrange
-        let val = serde_json::json!({ "unread": true, "updatedAt": T1 });
-
-        // act
-        let parsed = parse_stored_read_state(&val);
-
-        // assert
-        assert_eq!(parsed, Some(full(true, T1, ReadStateSource::Auto)));
-    }
-
-    #[test]
-    fn parse_object_unknown_source_defaults_to_auto() {
-        // arrange
-        let val = serde_json::json!({ "unread": true, "updatedAt": T1, "source": "weird" });
-
-        // act
-        let parsed = parse_stored_read_state(&val);
-
-        // assert
-        assert_eq!(parsed, Some(full(true, T1, ReadStateSource::Auto)));
-    }
-
-    #[test]
-    fn parse_object_missing_updated_at_defaults_to_empty() {
-        // arrange
-        let val = serde_json::json!({ "unread": true });
-
-        // act
-        let parsed = parse_stored_read_state(&val);
-
-        // assert
-        assert_eq!(parsed, Some(full(true, "", ReadStateSource::Auto)));
-    }
-
-    #[test]
-    fn parse_legacy_bool_returns_legacy_variant() {
-        // act
-        let parsed_false = parse_stored_read_state(&serde_json::Value::Bool(false));
-        let parsed_true = parse_stored_read_state(&serde_json::Value::Bool(true));
-
-        // assert
-        assert_eq!(parsed_false, Some(StoredReadState::LegacyBool(false)));
-        assert_eq!(parsed_true, Some(StoredReadState::LegacyBool(true)));
-    }
-
-    #[test]
-    fn parse_unknown_value_returns_none() {
-        // act / assert
-        assert_eq!(parse_stored_read_state(&serde_json::Value::Null), None);
-        assert_eq!(parse_stored_read_state(&serde_json::json!("string")), None);
-        assert_eq!(parse_stored_read_state(&serde_json::json!(42)), None);
     }
 
     // --- decide_unread_status: new MR ---
@@ -1380,13 +1357,13 @@ mod tests {
 
     #[test]
     fn user_pin_invalidated_then_approval_marks_read() {
-        // arrange — pin valid for T1, but MR is now at T2; pin holds only while updatedAt matches
+        // arrange
         let stored = full(true, T1, ReadStateSource::User);
 
         // act
         let r = decide(Some(&stored), T2, &[], true);
 
-        // assert — approval kicks in next, marks read
+        // assert
         assert!(!r.unread);
         assert_eq!(r.source, ReadStateSource::Auto);
     }
@@ -1436,8 +1413,7 @@ mod tests {
 
     #[test]
     fn approval_keeps_read_when_only_system_notes_follow() {
-        // arrange — approval silences CI/push noise: a system note from another
-        // must not resurface the MR
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
 
         // act
@@ -1451,7 +1427,7 @@ mod tests {
 
     #[test]
     fn approval_does_not_silence_human_comment_from_others() {
-        // arrange — a real comment must reach me even after I approved (matches user's spec)
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
         let other = note("alice", T2);
 
@@ -1466,7 +1442,7 @@ mod tests {
 
     #[test]
     fn approval_then_my_own_comment_stays_read() {
-        // arrange — approving and then commenting myself: I'm up to date, no resurface
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
         let notes = [note(ME, T3), system_note(ME, T2)];
 
@@ -1480,7 +1456,7 @@ mod tests {
 
     #[test]
     fn approval_with_others_comment_before_my_action_stays_read() {
-        // arrange — others commented, then I approved on top; I've seen it, stay read
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
         let notes = [system_note(ME, T3), note("alice", T2)];
 
@@ -1525,8 +1501,7 @@ mod tests {
 
     #[test]
     fn my_comment_after_others_note_does_not_set_actor() {
-        // arrange — user pinned unread, then commented themselves: must stay unread
-        // but expose no actor, so polling won't fire a notification for my own comment
+        // arrange
         let stored = full(true, T1, ReadStateSource::User);
 
         // act
@@ -1620,7 +1595,7 @@ mod tests {
 
     #[test]
     fn auto_state_changed_mr_with_my_requested_changes_and_others_activity_marks_unread() {
-        // arrange — key fix-cycle case: I asked for changes, author pushed/replied
+        // arrange
         let stored = full(false, T1, ReadStateSource::Auto);
         let other = note("alice", T2);
 
@@ -1712,8 +1687,7 @@ mod tests {
 
     #[test]
     fn user_pin_unchanged_mr_with_same_review_request_respects_pin() {
-        // arrange — user read the MR while this re-request todo was already pending:
-        // the todo id matches the pin anchor, so the pin holds
+        // arrange
         let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
 
         // act
@@ -1726,8 +1700,7 @@ mod tests {
 
     #[test]
     fn user_pin_broken_by_new_review_request() {
-        // arrange — user read the MR with no re-request pending, then a re-request
-        // arrives: a fresh todo id breaks the pin and marks the MR unread
+        // arrange
         let stored = full_todo(false, T1, ReadStateSource::User, None);
 
         // act
@@ -1740,8 +1713,7 @@ mod tests {
 
     #[test]
     fn user_pin_broken_by_changed_review_request_todo() {
-        // arrange — user read the MR during one re-request, then the author
-        // re-requests again (new todo id) without touching updated_at
+        // arrange
         let stored = full_todo(false, T1, ReadStateSource::User, Some(7));
 
         // act
@@ -1762,7 +1734,7 @@ mod tests {
             reviewer(1, Some("requested_changes")),
         ];
 
-        // act / assert
+        // assert
         assert!(me_requested_changes(&reviewers, 1));
     }
 
@@ -1772,7 +1744,7 @@ mod tests {
             // arrange
             let reviewers = vec![reviewer(1, Some(state))];
 
-            // act / assert
+            // assert
             assert!(!me_requested_changes(&reviewers, 1));
         }
     }
@@ -1782,7 +1754,7 @@ mod tests {
         // arrange
         let reviewers = vec![reviewer(1, None)];
 
-        // act / assert
+        // assert
         assert!(!me_requested_changes(&reviewers, 1));
     }
 
@@ -1791,13 +1763,13 @@ mod tests {
         // arrange
         let reviewers = vec![reviewer(2, Some("requested_changes"))];
 
-        // act / assert
+        // assert
         assert!(!me_requested_changes(&reviewers, 1));
     }
 
     #[test]
     fn me_requested_changes_returns_false_for_empty_reviewers() {
-        // act / assert
+        // assert
         assert!(!me_requested_changes(&[], 1));
     }
 
@@ -1885,13 +1857,13 @@ mod tests {
         // assert
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].who, mr.author.username);
-        assert_eq!(events[0].time, mr.updated_at);
+        assert_eq!(events[0].time, mr.created_at);
         assert!(events[0].text.contains("opened"));
     }
 
     #[test]
     fn notes_to_activity_keeps_newest_20_notes_in_chronological_order() {
-        // arrange — 25 notes, API order is newest-first (sort=desc)
+        // arrange
         let notes: Vec<GitLabNote> = (0..25)
             .map(|i| note("alice", &format!("2026-03-{:02}T10:00:00Z", 25 - i)))
             .collect();
@@ -1900,7 +1872,7 @@ mod tests {
         // act
         let events = notes_to_activity(&notes, &mr);
 
-        // assert — opened event plus the 20 newest notes, oldest-kept first
+        // assert
         let note_times: Vec<String> = events[1..].iter().map(|e| e.time.clone()).collect();
         let expected: Vec<String> = (6..=25)
             .map(|d| format!("2026-03-{:02}T10:00:00Z", d))
@@ -1908,13 +1880,226 @@ mod tests {
         assert_eq!(note_times, expected);
     }
 
-    // --- ReadStateSource round-trip ---
+    #[test]
+    fn determine_role_reviewer_wins_over_assignee() {
+        // arrange
+        let mr = gl_mr_roles(
+            Some(vec![gl_user(1, "me")]),
+            Some(vec![gl_user(1, "me")]),
+            "opened",
+        );
+
+        // assert
+        assert_eq!(determine_role(&mr, 1), UserRole::Reviewer);
+    }
 
     #[test]
-    fn read_state_source_roundtrip() {
-        for src in [ReadStateSource::User, ReadStateSource::Auto] {
-            // act / assert
-            assert_eq!(ReadStateSource::from_stored(src.as_str()), src);
+    fn determine_role_assignee_when_not_reviewer() {
+        // arrange
+        let mr = gl_mr_roles(
+            Some(vec![gl_user(2, "other")]),
+            Some(vec![gl_user(1, "me")]),
+            "opened",
+        );
+
+        // assert
+        assert_eq!(determine_role(&mr, 1), UserRole::Assignee);
+    }
+
+    #[test]
+    fn determine_role_falls_back_to_reviewer() {
+        // arrange
+        let mr = gl_mr_roles(Some(vec![gl_user(2, "other")]), None, "opened");
+
+        // assert
+        assert_eq!(determine_role(&mr, 1), UserRole::Reviewer);
+    }
+
+    #[test]
+    fn determine_status_reflects_state_and_approvals() {
+        // assert
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "merged"), 0, 0, false),
+            MrStatus::Merged
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "closed"), 0, 0, false),
+            MrStatus::Closed
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 2, 2, false),
+            MrStatus::Approved
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 1, 2, false),
+            MrStatus::Open
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 0, 0, false),
+            MrStatus::Open
+        );
+    }
+
+    #[test]
+    fn determine_status_requested_changes_overrides_approval() {
+        // assert
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "opened"), 2, 2, true),
+            MrStatus::Changes
+        );
+        assert_eq!(
+            determine_status(&gl_mr_roles(None, None, "merged"), 0, 0, true),
+            MrStatus::Merged
+        );
+    }
+
+    #[test]
+    fn make_initials_takes_first_two_word_starts_uppercased() {
+        // assert
+        assert_eq!(make_initials("backend-api-gateway"), "BA");
+        assert_eq!(make_initials("frontend"), "F");
+        assert_eq!(make_initials("my_cool service"), "MC");
+        assert_eq!(make_initials(""), "");
+    }
+
+    #[test]
+    fn notes_to_activity_orders_open_then_oldest_to_newest() {
+        // arrange
+        let mr = gl_mr_roles(None, None, "opened");
+        let notes = vec![note("alice", T3), note("bob", T2)];
+
+        // act
+        let activity = notes_to_activity(&notes, &mr);
+
+        // assert
+        let times: Vec<&str> = activity.iter().map(|e| e.time.as_str()).collect();
+        assert_eq!(times, vec![T1, T2, T3]);
+    }
+
+    #[test]
+    fn notes_to_activity_marks_system_notes_with_sys_author() {
+        // arrange
+        let mr = gl_mr_roles(None, None, "opened");
+        let sys = system_note("alice", T2);
+
+        // act
+        let activity = notes_to_activity(std::slice::from_ref(&sys), &mr);
+
+        // assert
+        let event = activity.last().unwrap();
+        assert_eq!(event.who, "sys");
+        assert_eq!(event.text, sys.body);
+    }
+
+    #[test]
+    fn is_transient_status_matches_retryable_codes() {
+        // assert
+        for code in [408u16, 429, 500, 502, 503, 504] {
+            assert!(is_transient_status(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
         }
+        for code in [200u16, 301, 400, 401, 403, 404] {
+            assert!(!is_transient_status(
+                reqwest::StatusCode::from_u16(code).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn connect_error_for_status_maps_each_failure() {
+        // assert
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::UNAUTHORIZED),
+            Some("Invalid token or token expired".to_string())
+        );
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some("Rate limited by GitLab. Try again later.".to_string())
+        );
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::FORBIDDEN),
+            Some("GitLab API error: 403 Forbidden".to_string())
+        );
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            Some("GitLab API error: 500 Internal Server Error".to_string())
+        );
+        assert_eq!(connect_error_for_status(reqwest::StatusCode::OK), None);
+    }
+
+    #[test]
+    fn color_for_project_wraps_around_palette() {
+        // act
+        let first = color_for_project(0);
+        let wrapped = color_for_project(8);
+        let second = color_for_project(1);
+
+        // assert
+        assert_eq!(first, wrapped);
+        assert_ne!(first, second);
+    }
+
+    fn gl_project(name: &str, namespace: &str) -> GitLabProject {
+        GitLabProject {
+            name: name.to_string(),
+            namespace: GitLabNamespace {
+                name: namespace.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn build_projects_sorts_by_name_and_colors_deterministically() {
+        // arrange
+        let cache = HashMap::from([
+            (30, gl_project("charlie", "ns")),
+            (10, gl_project("alpha", "ns")),
+            (20, gl_project("bravo", "ns")),
+        ]);
+
+        // act
+        let projects = build_projects(&cache);
+
+        // assert
+        assert_eq!(
+            projects,
+            vec![
+                Project {
+                    id: 10,
+                    name: "alpha".to_string(),
+                    namespace: "ns".to_string(),
+                    color: color_for_project(0).to_string(),
+                    initials: make_initials("alpha"),
+                },
+                Project {
+                    id: 20,
+                    name: "bravo".to_string(),
+                    namespace: "ns".to_string(),
+                    color: color_for_project(1).to_string(),
+                    initials: make_initials("bravo"),
+                },
+                Project {
+                    id: 30,
+                    name: "charlie".to_string(),
+                    namespace: "ns".to_string(),
+                    color: color_for_project(2).to_string(),
+                    initials: make_initials("charlie"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn find_latest_comment_handles_millisecond_timestamps() {
+        // arrange
+        let since = "2026-01-01T10:00:00.000Z";
+        let newer = note("alice", "2026-01-01T10:00:01.000Z");
+
+        // act
+        let actor = find_latest_comment_from_others(std::slice::from_ref(&newer), ME, since);
+
+        // assert
+        assert_eq!(actor, Some(newer.author.name));
     }
 }
