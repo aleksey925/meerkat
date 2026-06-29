@@ -42,6 +42,10 @@ function getAuthorInfo(mr) {
   };
 }
 
+function visibleMergeRequests(mergeRequests, showDrafts) {
+  return showDrafts ? mergeRequests : mergeRequests.filter((m) => !m.draft);
+}
+
 function useRelativeTime(date) {
   const [now, setNow] = useState(Date.now());
 
@@ -422,7 +426,7 @@ function InboxView({
 }) {
   const lastCheckedLabel = useRelativeTime(lastChecked);
   const [listRef] = useAutoAnimate({ duration: 250 });
-  const visible = showDrafts ? mergeRequests : mergeRequests.filter((m) => !m.draft);
+  const visible = visibleMergeRequests(mergeRequests, showDrafts);
   const filtered = (() => {
     let list = visible;
     if (selectedProject > 0) list = list.filter((m) => m.projectId === selectedProject);
@@ -598,17 +602,28 @@ export default function App() {
   const projects = gitlab.projects;
 
   // the backend owns the polling lifecycle, so connect/disconnect only reset the
-  // view: a fresh connect clears the old account's MRs and shows loading until
-  // the new account's first poll arrives.
+  // view. the previous account's poll task stops only inside connect, after token
+  // validation, so a stale mr-update from it can land between the first
+  // prepareReload and connect resolving. on success clear again - connect has
+  // returned, so the old task is fully stopped and only the new account can emit
+  // now - and reset the account-scoped selection so a stale project filter or MR
+  // id cannot hide or mis-open the new account's list. seedFromCache then shows
+  // the new account if its first poll already cached a payload, or on failure
+  // restores the still-polling previous account's cached data.
   const handleConnect = useCallback(async () => {
+    gitlab.prepareReload();
     if (await connect()) {
+      setSelectedProject(0);
+      setSelectedMrId(null);
       gitlab.prepareReload();
     }
-  }, [connect, gitlab.prepareReload]);
+    gitlab.seedFromCache();
+  }, [connect, gitlab.prepareReload, gitlab.seedFromCache]);
 
   const handleDisconnect = useCallback(async () => {
-    await disconnect();
-    gitlab.prepareReload();
+    if (await disconnect()) {
+      gitlab.prepareReload();
+    }
   }, [disconnect, gitlab.prepareReload]);
 
   useEffect(() => {
@@ -715,7 +730,7 @@ export default function App() {
   // hidden drafts must not drive any badge the user cannot see, so every count
   // (sidebar, per-project, tray) works off the same draft-filtered list the
   // inbox renders.
-  const visibleMrs = settings.showDrafts ? mergeRequests : mergeRequests.filter((m) => !m.draft);
+  const visibleMrs = visibleMergeRequests(mergeRequests, settings.showDrafts);
 
   // sync tray badge whenever totalUnread changes
   const totalUnread = visibleMrs.filter((m) => m.unread).length;

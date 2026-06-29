@@ -25,6 +25,24 @@ export function useGitlab(showToast) {
   const [checking, setChecking] = useState(false);
   const manualCheckPending = useRef(false);
 
+  // pulls the backend's cached snapshot into the view. used on mount (the first
+  // mr-update may have fired before the listener attached) and after a failed
+  // connect (to restore the still-polling previous account's data).
+  const seedFromCache = useCallback(() => {
+    const invoke = getTauriInvoke();
+    if (!invoke) return;
+    invoke("get_last_update")
+      .then((payload) => {
+        if (!payload) return;
+        setMergeRequests(payload.active);
+        setProjects(payload.projects);
+        setOffline(false);
+        setLastChecked(new Date());
+        setLoading(false);
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     const listenPromise = getTauriListen();
     if (!listenPromise) return;
@@ -72,6 +90,11 @@ export function useGitlab(showToast) {
       }).then((fn) => {
         unlistenReminders = fn;
       });
+
+      // the backend may have emitted the first mr-update before this listener
+      // attached; pull the cached snapshot so the UI shows data instead of
+      // staying on "Loading..." until the next poll interval.
+      seedFromCache();
     });
 
     return () => {
@@ -79,7 +102,7 @@ export function useGitlab(showToast) {
       if (unlistenErr) unlistenErr();
       if (unlistenReminders) unlistenReminders();
     };
-  }, [showToast]);
+  }, [showToast, seedFromCache]);
 
   // clears the view and shows loading while a freshly connected account's first
   // poll cycle loads. the backend owns starting/stopping polling (on
@@ -89,6 +112,10 @@ export function useGitlab(showToast) {
     setProjects([]);
     setOffline(false);
     setLoading(true);
+    // drop any pending manual check so a switch doesn't carry the flag across
+    // accounts and fire a false "Updated just now" on the next account's poll
+    setChecking(false);
+    manualCheckPending.current = false;
   }, []);
 
   const checkNow = useCallback(async () => {
@@ -195,6 +222,7 @@ export function useGitlab(showToast) {
     lastChecked,
     checking,
     prepareReload,
+    seedFromCache,
     checkNow,
     toggleUnread,
     openGitLab,

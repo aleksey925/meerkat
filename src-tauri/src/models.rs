@@ -105,6 +105,17 @@ pub struct Settings {
     pub connected: bool,
 }
 
+// non-identity settings persisted by save_preferences. kept separate from
+// Settings so the command signature only exposes the fields it actually writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preferences {
+    pub poll_interval: String,
+    pub show_drafts: bool,
+    pub desktop_notif: bool,
+    pub sound_notif: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MrUpdatePayload {

@@ -91,7 +91,10 @@ pub fn run() {
                             let _ = app.emit("navigate", "settings");
                         }
                         "check_now" => {
-                            polling::check_now();
+                            let app = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                polling::check_now(app).await;
+                            });
                         }
                         "quit" => {
                             std::process::exit(0);
@@ -100,6 +103,10 @@ pub fn run() {
                     });
                 }
             }
+
+            // fold the pre-object identity layout into the single object once, so
+            // every later read is one atomic get.
+            crate::commands::system::migrate_legacy_identity(app.handle());
 
             // the backend owns the polling lifecycle: start it on launch when an
             // account is configured, and let connect/disconnect manage it after.
@@ -137,6 +144,7 @@ pub fn run() {
             commands::system::send_test_notification,
             commands::system::get_app_version,
             polling::check_now,
+            polling::get_last_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

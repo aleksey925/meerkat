@@ -47,7 +47,9 @@ and install it manually.
 3. Enter a **personal access token** with the `read_api` (or `api`) scope.
    The token is stored in your OS keychain (service `meerkat`, account
    `gitlab-pat`), never in a plain file.
-4. Click **Save**.
+4. Click **Save**. The status badge in the Connection card turns **Connected**
+   on success; use **Disconnect** there to sign out (your URL stays filled in
+   and the account's data is kept for when you reconnect).
 
 ## Development
 

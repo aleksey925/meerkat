@@ -1,5 +1,5 @@
 use crate::commands::gitlab::fetch_merge_requests;
-use crate::models::{MergeRequest, PipelineStatus};
+use crate::models::{MergeRequest, MrUpdatePayload, PipelineStatus};
 use crate::notifications;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -17,14 +17,26 @@ static PREVIOUS_MRS: Mutex<Option<Vec<MergeRequest>>> = Mutex::new(None);
 static POLL_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 // wakes the polling loop early for a manual check_now (see start_polling).
 static WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
+// serializes connect/disconnect so the stop -> swap identity -> start sequence is
+// never interleaved. without it a second lifecycle call could take the poll handle
+// (see stop_polling) and mutate the identity while the first call's aborted cycle
+// is still unwinding a write into the old account's store.
+static LIFECYCLE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+// the most recent successful payload, served to a frontend that mounts after the
+// first mr-update was already emitted so it shows data instead of "Loading...".
+static LAST_PAYLOAD: Mutex<Option<MrUpdatePayload>> = Mutex::new(None);
 
 // clears the in-memory snapshot so a freshly connected account does not diff its
-// MRs against the previous account's and fire false notifications. per-account
-// read-state and reminders live in their own files (see account_store_name), so
-// nothing on disk needs clearing.
+// MRs against the previous account's and fire false notifications, and drops the
+// cached payload so a reconnect never serves the old account's data on mount.
+// per-account read-state and reminders live in their own files (see
+// account_store_name), so nothing on disk needs clearing.
 pub(crate) fn reset_previous_mrs() {
     if let Ok(mut prev) = PREVIOUS_MRS.lock() {
         *prev = None;
+    }
+    if let Ok(mut last) = LAST_PAYLOAD.lock() {
+        *last = None;
     }
 }
 
@@ -202,17 +214,9 @@ fn check_and_fire_reminders(app: &AppHandle) {
             Err(_) => continue,
         };
 
-        let (title, prev_updated_at) = {
-            let prev = PREVIOUS_MRS.lock().ok();
-            let mr = prev
-                .as_ref()
-                .and_then(|opt| opt.as_ref())
-                .and_then(|mrs| mrs.iter().find(|m| m.id == mr_id).cloned());
-            match mr {
-                Some(m) => (m.title, m.updated_at_raw),
-                None => (format!("MR #{mr_id}"), String::new()),
-            }
-        };
+        let (title, prev_updated_at) =
+            with_previous_mr(mr_id, |m| (m.title.clone(), m.updated_at_raw.clone()))
+                .unwrap_or_else(|| (format!("MR #{mr_id}"), String::new()));
 
         notifications::notify_reminder(app, &title);
 
@@ -274,6 +278,9 @@ async fn run_check_cycle(app: &AppHandle) -> Result<(), String> {
             if let Ok(mut prev) = PREVIOUS_MRS.lock() {
                 *prev = Some(payload.active.clone());
             }
+            if let Ok(mut last) = LAST_PAYLOAD.lock() {
+                *last = Some(payload.clone());
+            }
 
             let _ = app.emit("mr-update", &payload);
             Ok(())
@@ -312,10 +319,19 @@ fn poll_interval_secs(app: &AppHandle) -> u64 {
         .unwrap_or(30)
 }
 
+fn take_poll_task() -> Option<JoinHandle<()>> {
+    POLL_TASK.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+// held for the whole duration of a connect/disconnect, so the stop/swap/start
+// sequence runs to completion before another lifecycle call can start.
+pub(crate) async fn lock_lifecycle() -> tokio::sync::MutexGuard<'static, ()> {
+    LIFECYCLE.lock().await
+}
+
 // starts the single polling task, aborting any previous one first.
 pub(crate) fn start_polling(app: AppHandle) {
-    let mut slot = POLL_TASK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(handle) = slot.take() {
+    if let Some(handle) = take_poll_task() {
         handle.abort();
     }
     let handle = tauri::async_runtime::spawn(async move {
@@ -335,19 +351,36 @@ pub(crate) fn start_polling(app: AppHandle) {
             }
         }
     });
-    *slot = Some(handle);
+    *POLL_TASK.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 }
 
-pub(crate) fn stop_polling() {
-    let mut slot = POLL_TASK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(handle) = slot.take() {
+// aborts the poll task and waits for it to fully unwind. awaiting matters because
+// abort only schedules cancellation: without the join, the caller could swap the
+// identity while the old cycle is still mid-write into the old account's store.
+pub(crate) async fn stop_polling() {
+    if let Some(handle) = take_poll_task() {
         handle.abort();
+        let _ = handle.await;
     }
 }
 
 #[tauri::command]
-pub fn check_now() {
-    WAKE.notify_one();
+pub async fn check_now(app: AppHandle) {
+    // hold LIFECYCLE so the connected-check and the wake are atomic against a
+    // concurrent connect/disconnect. without it, a check landing in the stopped
+    // window could see is_connected true, store a permit, and have the next poll
+    // task consume it for one spurious immediate cycle.
+    let _guard = lock_lifecycle().await;
+    // ignore when disconnected: there is no loop to wake, and notify_one would
+    // otherwise leave a permit that fires one extra cycle the moment polling starts.
+    if crate::commands::settings::is_connected(&app) {
+        WAKE.notify_one();
+    }
+}
+
+#[tauri::command]
+pub fn get_last_update() -> Option<MrUpdatePayload> {
+    LAST_PAYLOAD.lock().ok().and_then(|p| p.clone())
 }
 
 #[cfg(test)]

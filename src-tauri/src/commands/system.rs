@@ -1,20 +1,113 @@
-use tauri::AppHandle;
+use tauri::{AppHandle, Wry};
 use tauri_plugin_opener::OpenerExt;
-use tauri_plugin_store::StoreExt;
+use tauri_plugin_store::{Store, StoreExt};
 
 pub(crate) const READ_STATE_PREFIX: &str = "mr_read_state";
+
+// the validated identity lives in a single store object so a reader sees either
+// the whole old identity or the whole new one, never a torn mix of a new url with
+// a stale user_id. only `connect`/`disconnect` write it.
+const IDENTITY_KEY: &str = "identity";
+
+// write-ahead marker that the keychain token matches the stored identity. the
+// keychain and settings.json cannot be written atomically, so commit_identity
+// sets this false before the keychain write and true after. a crash in that
+// window leaves it false, and startup refuses to poll (fail closed) instead of
+// silently polling a stale-token/identity mix - e.g. a same-host account switch
+// where the old token would authenticate as the old user under the new user_id
+// filter and never 401.
+const TOKEN_COMMITTED_KEY: &str = "token_committed";
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredIdentity {
+    pub url: String,
+    pub user_id: Option<i64>,
+    pub username: String,
+}
+
+fn parse_identity(val: &serde_json::Value) -> Option<StoredIdentity> {
+    let obj = val.as_object()?;
+    Some(StoredIdentity {
+        url: obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        user_id: obj.get("user_id").and_then(|v| v.as_i64()),
+        username: obj
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+pub(crate) fn encode_identity(
+    url: &str,
+    user_id: Option<i64>,
+    username: &str,
+) -> serde_json::Value {
+    serde_json::json!({ "url": url, "user_id": user_id, "username": username })
+}
+
+pub(crate) fn read_identity(store: &Store<Wry>) -> StoredIdentity {
+    if let Some(identity) = store.get(IDENTITY_KEY).as_ref().and_then(parse_identity) {
+        return identity;
+    }
+    // fall back to the pre-object layout for an install that has not reconnected
+    // since the upgrade; migrate_legacy_identity rewrites these into the object on
+    // startup, so this branch is only hit before that runs.
+    StoredIdentity {
+        url: store
+            .get("gitlab_url")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default(),
+        user_id: store.get("user_id").and_then(|v| v.as_i64()),
+        username: store
+            .get("username")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default(),
+    }
+}
+
+pub(crate) fn write_identity(store: &Store<Wry>, url: &str, user_id: Option<i64>, username: &str) {
+    store.set(IDENTITY_KEY, encode_identity(url, user_id, username));
+}
+
+pub(crate) fn identity_connected(url: &str, user_id: Option<i64>, has_token: bool) -> bool {
+    has_token && user_id.is_some() && !url.is_empty()
+}
+
+// absent defaults to true so installs that connected before this marker existed
+// keep their connection; only a value explicitly set false (mid-commit crash)
+// fails closed.
+fn token_committed_value(val: Option<&serde_json::Value>) -> bool {
+    val.and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+pub(crate) fn token_committed(store: &Store<Wry>) -> bool {
+    token_committed_value(store.get(TOKEN_COMMITTED_KEY).as_ref())
+}
+
+pub(crate) fn set_token_committed(store: &Store<Wry>, committed: bool) {
+    store.set(TOKEN_COMMITTED_KEY, serde_json::json!(committed));
+}
 
 // each account's read-state and reminders live in their own store file, keyed by
 // host + user_id, so switching accounts reads different files and no per-account
 // state has to be wiped. returns None when no account is configured yet.
 pub(crate) fn account_store_name(app: &AppHandle, prefix: &str) -> Option<String> {
     let store = app.store("settings.json").ok()?;
-    let url = store
-        .get("gitlab_url")
-        .and_then(|v| v.as_str().map(String::from))
-        .filter(|u| !u.is_empty())?;
-    let user_id = store.get("user_id").and_then(|v| v.as_i64())?;
-    Some(format!("{prefix}_{}_{user_id}.json", sanitize_host(&url)))
+    let identity = read_identity(&store);
+    store_file_name(prefix, &identity.url, identity.user_id)
+}
+
+fn store_file_name(prefix: &str, url: &str, user_id: Option<i64>) -> Option<String> {
+    let user_id = user_id?;
+    if url.trim_end_matches('/').is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}_{}_{user_id}.json", sanitize_host(url)))
 }
 
 fn sanitize_host(url: &str) -> String {
@@ -22,6 +115,35 @@ fn sanitize_host(url: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+// converts the pre-object identity layout (separate gitlab_url/user_id/username
+// keys) into the single identity object once, so existing installs keep their
+// connection and every later read is one atomic get.
+pub(crate) fn migrate_legacy_identity(app: &AppHandle) {
+    let Ok(store) = app.store("settings.json") else {
+        return;
+    };
+    if store.get(IDENTITY_KEY).is_some() {
+        return;
+    }
+    let url = store
+        .get("gitlab_url")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    let user_id = store.get("user_id").and_then(|v| v.as_i64());
+    let username = store
+        .get("username")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default();
+    if url.is_empty() && user_id.is_none() {
+        return;
+    }
+    write_identity(&store, &url, user_id, &username);
+    store.delete("gitlab_url");
+    store.delete("user_id");
+    store.delete("username");
+    let _ = store.save();
 }
 
 // before namespacing, read-state and reminders lived in single shared files.
@@ -37,6 +159,12 @@ pub(crate) fn migrate_legacy_stores(app: &AppHandle) {
     );
 }
 
+// copy only when the source has data and the target has none, so an account that
+// already owns data is never clobbered.
+fn should_copy_legacy(legacy_empty: bool, target_empty: bool) -> bool {
+    !legacy_empty && target_empty
+}
+
 fn migrate_legacy_store(app: &AppHandle, legacy_name: &str, prefix: &str) {
     let Some(target_name) = account_store_name(app, prefix) else {
         return;
@@ -44,14 +172,10 @@ fn migrate_legacy_store(app: &AppHandle, legacy_name: &str, prefix: &str) {
     let Ok(legacy) = app.store(legacy_name) else {
         return;
     };
-    if legacy.keys().is_empty() {
-        return;
-    }
     let Ok(target) = app.store(&target_name) else {
         return;
     };
-    // do not clobber an account that already has its own data
-    if !target.keys().is_empty() {
+    if !should_copy_legacy(legacy.keys().is_empty(), target.keys().is_empty()) {
         return;
     }
     for key in legacy.keys() {
@@ -59,7 +183,11 @@ fn migrate_legacy_store(app: &AppHandle, legacy_name: &str, prefix: &str) {
             target.set(key, value);
         }
     }
-    let _ = target.save();
+    // clear the source only after the copy is safely on disk: clearing on a failed
+    // save would drop the data from both files
+    if target.save().is_err() {
+        return;
+    }
     legacy.clear();
     let _ = legacy.save();
 }
@@ -164,10 +292,7 @@ pub(crate) fn encode_read_state(
     })
 }
 
-fn read_state(
-    store: &tauri_plugin_store::Store<tauri::Wry>,
-    key: &str,
-) -> (bool, String, Option<i64>) {
+fn read_state(store: &Store<Wry>, key: &str) -> (bool, String, Option<i64>) {
     match store.get(key).as_ref().and_then(StoredReadState::parse) {
         Some(state) => (
             state.unread(),
@@ -178,15 +303,12 @@ fn read_state(
     }
 }
 
-pub(crate) fn read_review_request_todo_id(
-    store: &tauri_plugin_store::Store<tauri::Wry>,
-    key: &str,
-) -> Option<i64> {
+pub(crate) fn read_review_request_todo_id(store: &Store<Wry>, key: &str) -> Option<i64> {
     read_state(store, key).2
 }
 
 pub(crate) fn write_state(
-    store: &tauri_plugin_store::Store<tauri::Wry>,
+    store: &Store<Wry>,
     key: &str,
     unread: bool,
     updated_at: &str,
@@ -290,6 +412,133 @@ mod tests {
             sanitize_host("https://gl.example.com"),
             "https___gl_example_com"
         );
+    }
+
+    #[test]
+    fn store_file_name_builds_per_account_name() {
+        // assert
+        assert_eq!(
+            store_file_name(READ_STATE_PREFIX, "https://gl.example.com/", Some(7)),
+            Some("mr_read_state_https___gl_example_com_7.json".to_string())
+        );
+    }
+
+    #[test]
+    fn store_file_name_none_without_user_id() {
+        // assert
+        assert_eq!(
+            store_file_name(READ_STATE_PREFIX, "https://gl.example.com", None),
+            None
+        );
+    }
+
+    #[test]
+    fn store_file_name_none_for_empty_url() {
+        // assert
+        assert_eq!(store_file_name(READ_STATE_PREFIX, "", Some(7)), None);
+        assert_eq!(store_file_name(READ_STATE_PREFIX, "/", Some(7)), None);
+    }
+
+    #[test]
+    fn parse_identity_reads_full_object() {
+        // arrange
+        let val = serde_json::json!({
+            "url": "https://gl.example.com",
+            "user_id": 42,
+            "username": "alice",
+        });
+
+        // act
+        let parsed = parse_identity(&val);
+
+        // assert
+        assert_eq!(
+            parsed,
+            Some(StoredIdentity {
+                url: "https://gl.example.com".to_string(),
+                user_id: Some(42),
+                username: "alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_identity_missing_user_id_is_none_field() {
+        // arrange
+        let val = serde_json::json!({ "url": "https://gl.example.com", "username": "" });
+
+        // act
+        let parsed = parse_identity(&val);
+
+        // assert
+        assert_eq!(
+            parsed,
+            Some(StoredIdentity {
+                url: "https://gl.example.com".to_string(),
+                user_id: None,
+                username: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_identity_non_object_returns_none() {
+        // assert
+        assert_eq!(parse_identity(&serde_json::Value::Null), None);
+        assert_eq!(parse_identity(&serde_json::json!("string")), None);
+    }
+
+    #[test]
+    fn encode_identity_roundtrips_through_parse() {
+        // act
+        let parsed = parse_identity(&encode_identity("https://gl.example.com", Some(7), "alice"));
+
+        // assert
+        assert_eq!(
+            parsed,
+            Some(StoredIdentity {
+                url: "https://gl.example.com".to_string(),
+                user_id: Some(7),
+                username: "alice".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn identity_connected_requires_url_user_and_token() {
+        // assert
+        assert!(identity_connected("https://gl.example.com", Some(7), true));
+        assert!(!identity_connected(
+            "https://gl.example.com",
+            Some(7),
+            false
+        ));
+        assert!(!identity_connected("https://gl.example.com", None, true));
+        assert!(!identity_connected("", Some(7), true));
+    }
+
+    #[test]
+    fn token_committed_value_defaults_true_when_absent_or_non_bool() {
+        // assert
+        assert!(token_committed_value(None));
+        assert!(token_committed_value(Some(&serde_json::Value::Null)));
+        assert!(token_committed_value(Some(&serde_json::json!("yes"))));
+    }
+
+    #[test]
+    fn token_committed_value_reads_explicit_bool() {
+        // assert
+        assert!(token_committed_value(Some(&serde_json::json!(true))));
+        assert!(!token_committed_value(Some(&serde_json::json!(false))));
+    }
+
+    #[test]
+    fn should_copy_legacy_only_when_source_has_data_and_target_empty() {
+        // assert
+        assert!(should_copy_legacy(false, true));
+        assert!(!should_copy_legacy(true, true));
+        assert!(!should_copy_legacy(false, false));
+        assert!(!should_copy_legacy(true, false));
     }
 
     #[test]

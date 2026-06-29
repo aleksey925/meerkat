@@ -64,14 +64,11 @@ export function useSettings(showToast) {
       const s = overrides || settings;
       try {
         await invoke("save_preferences", {
-          settings: {
-            url: s.url,
-            token: s.token,
+          preferences: {
             pollInterval: s.pollInterval,
             showDrafts: s.showDrafts,
             desktopNotif: s.desktopNotif,
             soundNotif: s.soundNotif,
-            connected: s.connected,
           },
         });
       } catch (e) {
@@ -100,24 +97,38 @@ export function useSettings(showToast) {
       showToast(`Connected as ${user.name}`);
       return true;
     } catch (e) {
-      setSettings((prev) => ({ ...prev, connected: false }));
+      // a failed connect may leave the backend either still polling the previous
+      // account (validation/save-failure resume) or fully disconnected (the
+      // rollback could not restore the previous token). re-query the real state
+      // instead of assuming, so the Disconnect button matches the backend.
+      try {
+        const s = await invoke("get_settings");
+        setSettings((prev) => ({ ...prev, connected: s.connected ?? false }));
+      } catch {
+        // keep the previous `connected` if the state cannot be re-queried
+      }
       showToast(`Connection failed: ${e}`);
       return false;
     }
   }, [settings.url, settings.token, showToast]);
 
+  // returns true only when the backend actually disconnected. on failure the
+  // backend rolls back to the previous account and keeps polling it, so the
+  // caller must not clear the view.
   const disconnect = useCallback(async () => {
     const invoke = getTauriInvoke();
     if (!invoke) {
       showToast("Tauri not available.");
-      return;
+      return false;
     }
     try {
       await invoke("disconnect");
       setSettings((prev) => ({ ...prev, token: "", connected: false }));
       showToast("Disconnected");
+      return true;
     } catch (e) {
       showToast(`Error: ${e}`);
+      return false;
     }
   }, [showToast]);
 

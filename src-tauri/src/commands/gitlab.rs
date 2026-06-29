@@ -4,8 +4,8 @@ use crate::models::*;
 use chrono::Utc;
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
-use tauri::AppHandle;
-use tauri_plugin_store::StoreExt;
+use tauri::{AppHandle, Wry};
+use tauri_plugin_store::{Store, StoreExt};
 use tokio::time::{sleep, Duration};
 
 // activity-feed colors; ACCENT_COLOR mirrors the frontend `--accent` purple (see
@@ -80,40 +80,48 @@ fn load_identity(app: &AppHandle) -> Result<Identity, String> {
         .store("settings.json")
         .map_err(|e| format!("Store error: {e}"))?;
 
-    let url = store
-        .get("gitlab_url")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
+    let stored = crate::commands::system::read_identity(&store);
     let token = credentials::get_token()?.unwrap_or_default();
 
-    if url.is_empty() || token.is_empty() {
+    if stored.url.is_empty() || token.is_empty() {
         return Err("GitLab URL or token not configured".to_string());
     }
 
-    let user_id = store
-        .get("user_id")
-        .and_then(|v| v.as_i64())
-        .ok_or("User ID not found. Connect first.")?;
-    let username = store
-        .get("username")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
+    let user_id = stored.user_id.ok_or("User ID not found. Connect first.")?;
 
     Ok(Identity {
-        url,
+        url: stored.url,
         token,
         user_id,
-        username,
+        username: stored.username,
     })
+}
+
+fn connect_error_for_status(status: reqwest::StatusCode) -> Option<String> {
+    if status == 401 {
+        Some("Invalid token or token expired".to_string())
+    } else if status == 429 {
+        Some("Rate limited by GitLab. Try again later.".to_string())
+    } else if !status.is_success() {
+        Some(format!("GitLab API error: {status}"))
+    } else {
+        None
+    }
 }
 
 // validates the token against the url, then commits the new identity and
 // restarts polling. validation happens before any write, so a bad token leaves
-// the existing identity untouched. the poll task is stopped before the write and
-// started after, so no cycle ever runs against a half-applied identity or emits
-// the previous account's data after the switch.
+// the existing identity untouched. the poll task is stopped (and awaited) before
+// the write and started after, so no cycle ever runs against a half-applied
+// identity or persists the previous account's data after the switch.
 #[tauri::command]
 pub async fn connect(app: AppHandle, url: String, token: String) -> Result<UserInfo, String> {
+    // lock before the GET /user validation, not just before the commit: tokio's
+    // Mutex is fair, so callers commit in request order and the last user action
+    // wins. validating outside the lock would let a slow Save commit a stale
+    // identity after a newer Save/Disconnect already finished (lost-update).
+    let _guard = crate::polling::lock_lifecycle().await;
+
     let client = build_client(&token)?;
     let api_url = format!("{}/api/v4/user", url.trim_end_matches('/'));
 
@@ -123,14 +131,8 @@ pub async fn connect(app: AppHandle, url: String, token: String) -> Result<UserI
         .await
         .map_err(|e| format!("Connection failed: {e}"))?;
 
-    if resp.status() == 401 {
-        return Err("Invalid token or token expired".to_string());
-    }
-    if resp.status() == 429 {
-        return Err("Rate limited by GitLab. Try again later.".to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("GitLab API error: {}", resp.status()));
+    if let Some(err) = connect_error_for_status(resp.status()) {
+        return Err(err);
     }
 
     let user: GitLabUser = resp
@@ -138,37 +140,35 @@ pub async fn connect(app: AppHandle, url: String, token: String) -> Result<UserI
         .await
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    crate::polling::stop_polling();
-
+    // every fallible read happens before polling stops, so a store or keychain read
+    // error returns with the previous account still polling instead of silently
+    // leaving the app stopped.
     let store = app
         .store("settings.json")
         .map_err(|e| format!("Store error: {e}"))?;
-
-    // write the validated token first; if persisting the identity then fails,
-    // roll the token back so disk identity and keychain never disagree.
+    let previous = crate::commands::system::read_identity(&store);
     let previous_token = credentials::get_token()?;
-    credentials::store_token(&token)?;
 
-    store.set("gitlab_url", serde_json::json!(url));
-    store.set("user_id", serde_json::json!(user.id));
-    store.set("username", serde_json::json!(user.username));
-    if let Err(e) = store.save() {
-        match previous_token {
-            Some(prev) => {
-                let _ = credentials::store_token(&prev);
-            }
-            None => {
-                let _ = credentials::delete_token();
-            }
-        }
-        return Err(format!("Save error: {e}"));
+    // wait for the previous account's task to fully unwind before touching the
+    // identity: abort alone only schedules cancellation, so an in-flight cycle
+    // could otherwise persist into the new account's store after the swap.
+    crate::polling::stop_polling().await;
+
+    if let Err(e) = commit_identity(&store, &url, &user, &token) {
+        crate::commands::settings::restore_identity(
+            &app,
+            &store,
+            &previous,
+            previous_token.as_deref(),
+        );
+        return Err(e);
     }
 
     // the new account reads its own per-account stores, so only the in-memory
-    // snapshot must be cleared; migrate any pre-namespacing data into this
-    // account once.
+    // snapshot must be cleared. legacy un-namespaced data is migrated at startup
+    // against the account present at upgrade - not here, where the connecting
+    // account may differ from the legacy data's owner and would inherit it.
     crate::polling::reset_previous_mrs();
-    crate::commands::system::migrate_legacy_stores(&app);
 
     crate::polling::start_polling(app);
 
@@ -178,6 +178,29 @@ pub async fn connect(app: AppHandle, url: String, token: String) -> Result<UserI
         name: user.name,
         avatar_url: user.avatar_url,
     })
+}
+
+// persists the validated identity and token across two stores that cannot be
+// written atomically. a write-ahead marker bridges the gap: the new identity is
+// written with token_committed=false and flushed first, then the keychain token,
+// then token_committed=true. a crash in the keychain-write window leaves the
+// marker false, and startup (is_connected) refuses to poll until the next Save -
+// so a stale-token/identity mix can never silently poll a wrong account (e.g. a
+// same-host account switch where the old token would not 401 under the new
+// user_id filter). any failure is recoverable by restore_identity, which restores
+// the previous account fully (marker included) before resuming its polling.
+fn commit_identity(
+    store: &Store<Wry>,
+    url: &str,
+    user: &GitLabUser,
+    token: &str,
+) -> Result<(), String> {
+    crate::commands::system::write_identity(store, url, Some(user.id), &user.username);
+    crate::commands::system::set_token_committed(store, false);
+    store.save().map_err(|e| format!("Save error: {e}"))?;
+    credentials::store_token(token)?;
+    crate::commands::system::set_token_committed(store, true);
+    store.save().map_err(|e| format!("Save error: {e}"))
 }
 
 async fn fetch_mrs_by_scope(
@@ -1981,6 +2004,28 @@ mod tests {
                 reqwest::StatusCode::from_u16(code).unwrap()
             ));
         }
+    }
+
+    #[test]
+    fn connect_error_for_status_maps_each_failure() {
+        // assert
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::UNAUTHORIZED),
+            Some("Invalid token or token expired".to_string())
+        );
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some("Rate limited by GitLab. Try again later.".to_string())
+        );
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::FORBIDDEN),
+            Some("GitLab API error: 403 Forbidden".to_string())
+        );
+        assert_eq!(
+            connect_error_for_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            Some("GitLab API error: 500 Internal Server Error".to_string())
+        );
+        assert_eq!(connect_error_for_status(reqwest::StatusCode::OK), None);
     }
 
     #[test]
