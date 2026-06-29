@@ -29,8 +29,7 @@ changes.
 ## Installation
 
 > **Requirements:** Meerkat ships only as an Apple Silicon (arm64) build and
-> requires macOS Big Sur (11) or newer. Intel Macs are not supported - the
-> downloaded DMG will not run on them.
+> requires macOS Big Sur (11) or newer. Intel Macs are not supported.
 
 The easiest way is via [Homebrew](https://brew.sh):
 
