@@ -28,17 +28,33 @@ changes.
 
 ## Installation
 
-Download the latest release from [releases](https://github.com/aleksey925/meerkat/releases)
-and install it manually.
+> **Requirements:** Meerkat ships only as an Apple Silicon (arm64) build and
+> requires macOS Big Sur (11) or newer. Intel Macs are not supported.
 
-> **Note:** Release builds are not signed with an Apple Developer certificate, so macOS Gatekeeper
-> will show a warning that the app is damaged or can't be opened. To fix this, run:
+The easiest way is via [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask aleksey925/apps/meerkat
+```
+
+> **Note:** Meerkat is not signed with an Apple Developer certificate, so macOS
+> Gatekeeper would normally block it. The cask handles this for you: during
+> install it runs `xattr -dr com.apple.quarantine` on the app to strip the
+> quarantine flag, so no extra steps are needed.
+
+Alternatively, download the latest release from
+[releases](https://github.com/aleksey925/meerkat/releases) and install it
+manually.
+
+> **Note:** With a manual install, Gatekeeper will warn that the app is
+> damaged or can't be opened (same unsigned-build reason as above). To fix
+> this, run:
 >
 > ```bash
-> xattr -cr /Applications/Meerkat.app
+> xattr -dr com.apple.quarantine /Applications/Meerkat.app
 > ```
->
-> Alternatively, you can [build from source](#build) on your machine to avoid this issue.
+
+Also, you can [build from source](#build).
 
 ## Usage
 
