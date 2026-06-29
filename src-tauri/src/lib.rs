@@ -13,6 +13,10 @@ use tauri::{Emitter, Manager};
 // absent -> manual launch (show the window).
 const AUTOSTART_ARG: &str = "--autostart";
 
+fn launched_by_autostart(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|arg| arg == AUTOSTART_ARG)
+}
+
 #[cfg(target_os = "macos")]
 static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -83,8 +87,7 @@ pub fn run() {
 
             // the window starts hidden (visible:false in tauri.conf.json) to
             // avoid a flash on a login-item launch.
-            let launched_by_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
-            if launched_by_autostart {
+            if launched_by_autostart(std::env::args()) {
                 #[cfg(target_os = "macos")]
                 let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             } else {
@@ -127,7 +130,6 @@ pub fn run() {
             // every later read is one atomic get.
             crate::commands::system::migrate_legacy_identity(app.handle());
 
-            // reconcile the OS launch-agent with the stored autostart preference.
             crate::commands::settings::sync_autostart(app.handle());
 
             // the backend owns the polling lifecycle: start it on launch when an
@@ -208,4 +210,29 @@ pub fn run() {
                 let _ = (&app_handle, &event);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launched_by_autostart_detects_flag() {
+        // arrange
+        let args = ["meerkat".to_string(), AUTOSTART_ARG.to_string()];
+        // act
+        let result = launched_by_autostart(args.into_iter());
+        // assert
+        assert!(result);
+    }
+
+    #[test]
+    fn launched_by_autostart_without_flag() {
+        // arrange
+        let args = ["meerkat".to_string()];
+        // act
+        let result = launched_by_autostart(args.into_iter());
+        // assert
+        assert!(!result);
+    }
 }

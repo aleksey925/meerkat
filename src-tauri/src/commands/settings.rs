@@ -2,11 +2,11 @@ use crate::commands::system;
 use crate::credentials;
 use crate::models::{Preferences, Settings};
 use tauri::{AppHandle, Wry};
+#[cfg(not(debug_assertions))]
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_store::{Store, StoreExt};
 
-// absent defaults to true so a fresh install launches on login; only an explicit
-// false (the user turned it off) keeps it disabled.
+// absent defaults to true so a fresh install launches on login.
 fn autostart_enabled_value(val: Option<&serde_json::Value>) -> bool {
     val.and_then(|v| v.as_bool()).unwrap_or(true)
 }
@@ -15,17 +15,25 @@ fn read_autostart(store: &Store<Wry>) -> bool {
     autostart_enabled_value(store.get("autostart").as_ref())
 }
 
+// dev builds share the production app name "Meerkat", so the launch agent would
+// be registered under the same ~/Library/LaunchAgents/Meerkat.plist as the
+// installed app. running a debug build would overwrite that plist with a path
+// into target/debug, breaking the installed app's login item. skip the OS
+// registration in debug; the preference is still persisted so the toggle works.
+#[cfg(debug_assertions)]
+fn apply_autostart(_app: &AppHandle, _enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
 fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let manager = app.autolaunch();
-    if enabled {
-        manager
-            .enable()
-            .map_err(|e| format!("Autostart enable error: {e}"))
+    let (result, action) = if enabled {
+        (manager.enable(), "enable")
     } else {
-        manager
-            .disable()
-            .map_err(|e| format!("Autostart disable error: {e}"))
-    }
+        (manager.disable(), "disable")
+    };
+    result.map_err(|e| format!("Autostart {action} error: {e}"))
 }
 
 // the OS launch-agent registration and the stored preference can drift (manual
@@ -35,7 +43,9 @@ pub(crate) fn sync_autostart(app: &AppHandle) {
     let Ok(store) = app.store("settings.json") else {
         return;
     };
-    let _ = apply_autostart(app, read_autostart(&store));
+    if let Err(e) = apply_autostart(app, read_autostart(&store)) {
+        log::warn!("{e}");
+    }
 }
 
 #[tauri::command]
@@ -219,16 +229,29 @@ mod tests {
 
     #[test]
     fn autostart_enabled_value_defaults_true_when_absent_or_non_bool() {
+        // arrange
+        let null = serde_json::Value::Null;
+        let non_bool = serde_json::json!("yes");
+        // act
+        let absent = autostart_enabled_value(None);
+        let null_value = autostart_enabled_value(Some(&null));
+        let non_bool_value = autostart_enabled_value(Some(&non_bool));
         // assert
-        assert!(autostart_enabled_value(None));
-        assert!(autostart_enabled_value(Some(&serde_json::Value::Null)));
-        assert!(autostart_enabled_value(Some(&serde_json::json!("yes"))));
+        assert!(absent);
+        assert!(null_value);
+        assert!(non_bool_value);
     }
 
     #[test]
     fn autostart_enabled_value_reads_explicit_bool() {
+        // arrange
+        let enabled = serde_json::json!(true);
+        let disabled = serde_json::json!(false);
+        // act
+        let enabled_value = autostart_enabled_value(Some(&enabled));
+        let disabled_value = autostart_enabled_value(Some(&disabled));
         // assert
-        assert!(autostart_enabled_value(Some(&serde_json::json!(true))));
-        assert!(!autostart_enabled_value(Some(&serde_json::json!(false))));
+        assert!(enabled_value);
+        assert!(!disabled_value);
     }
 }
