@@ -12,7 +12,8 @@ cask "meerkat" do
 
   app "Meerkat.app"
 
-  # app is unsigned; strip the quarantine flag so Gatekeeper does not block launch
+  # app is unsigned; strip the quarantine flag so Gatekeeper does not block
+  # launch.
   postflight do
     system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/Meerkat.app"]
   end

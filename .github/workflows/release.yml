@@ -8,6 +8,15 @@ on:
 permissions:
   contents: write
 
+# serialize concurrent runs of the same tag (a re-run, or delete+repush while
+# the first run is in flight). without this, both runs would clobber their own
+# DMG and push their own cask; tauri builds are not byte-reproducible, so the
+# release could end up with one run's DMG and the other run's committed sha256.
+# different tags use different groups and still run concurrently.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: macos-latest
@@ -31,6 +40,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # HOMEBREW_TAP_TOKEN must be a PAT with write access to the separate
+      # aleksey925/homebrew-apps tap repo, and that repo must already exist.
       - name: Update Homebrew cask
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
