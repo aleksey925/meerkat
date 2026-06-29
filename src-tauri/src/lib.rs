@@ -8,6 +8,11 @@ mod polling;
 use tauri::RunEvent;
 use tauri::{Emitter, Manager};
 
+// passed to the registered login item so a login-item launch can be told apart
+// from a manual one: present -> started by autostart (stay hidden in the tray),
+// absent -> manual launch (show the window).
+const AUTOSTART_ARG: &str = "--autostart";
+
 #[cfg(target_os = "macos")]
 static APP_WAS_INACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -63,6 +68,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARG]),
+        ))
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -70,6 +79,16 @@ pub fn run() {
                         .level(log::LevelFilter::Info)
                         .build(),
                 )?;
+            }
+
+            // the window starts hidden (visible:false in tauri.conf.json) to
+            // avoid a flash on a login-item launch.
+            let launched_by_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
+            if launched_by_autostart {
+                #[cfg(target_os = "macos")]
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            } else {
+                focus_main_window(app.handle());
             }
 
             #[cfg(desktop)]
@@ -107,6 +126,9 @@ pub fn run() {
             // fold the pre-object identity layout into the single object once, so
             // every later read is one atomic get.
             crate::commands::system::migrate_legacy_identity(app.handle());
+
+            // reconcile the OS launch-agent with the stored autostart preference.
+            crate::commands::settings::sync_autostart(app.handle());
 
             // the backend owns the polling lifecycle: start it on launch when an
             // account is configured, and let connect/disconnect manage it after.

@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS = {
   showDrafts: true,
   desktopNotif: true,
   soundNotif: true,
+  autostart: true,
   connected: false,
   tokenVisible: false,
 };
@@ -38,6 +39,7 @@ export function useSettings(showToast) {
           showDrafts: s.showDrafts ?? true,
           desktopNotif: s.desktopNotif ?? true,
           soundNotif: s.soundNotif ?? true,
+          autostart: s.autostart ?? true,
           connected: s.connected ?? false,
         }));
       })
@@ -52,8 +54,8 @@ export function useSettings(showToast) {
     setSettings(newSettings);
   }, []);
 
-  // persists non-identity settings (interval, drafts, notifications). the
-  // identity is committed only by connect, so this never touches url/token.
+  // persists non-identity settings only. the identity is committed by connect,
+  // so this never touches url/token.
   const savePreferences = useCallback(
     async (overrides) => {
       const invoke = getTauriInvoke();
@@ -69,6 +71,7 @@ export function useSettings(showToast) {
             showDrafts: s.showDrafts,
             desktopNotif: s.desktopNotif,
             soundNotif: s.soundNotif,
+            autostart: s.autostart,
           },
         });
       } catch (e) {

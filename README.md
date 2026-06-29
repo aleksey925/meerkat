@@ -24,6 +24,7 @@ changes.
 - Custom reminders for individual merge requests
 - Detail panel with activity timeline
 - Hides to tray on window close
+- Launch at login
 - Light and dark theme (follows system)
 
 ## Installation
