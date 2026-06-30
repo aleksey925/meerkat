@@ -102,6 +102,7 @@ pub struct Settings {
     pub show_drafts: bool,
     pub desktop_notif: bool,
     pub sound_notif: bool,
+    pub autostart: bool,
     pub connected: bool,
 }
 
@@ -114,6 +115,7 @@ pub struct Preferences {
     pub show_drafts: bool,
     pub desktop_notif: bool,
     pub sound_notif: bool,
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

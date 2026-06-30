@@ -2,7 +2,51 @@ use crate::commands::system;
 use crate::credentials;
 use crate::models::{Preferences, Settings};
 use tauri::{AppHandle, Wry};
+#[cfg(not(debug_assertions))]
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_store::{Store, StoreExt};
+
+// absent defaults to true so a fresh install launches on login.
+fn autostart_enabled_value(val: Option<&serde_json::Value>) -> bool {
+    val.and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+fn read_autostart(store: &Store<Wry>) -> bool {
+    autostart_enabled_value(store.get("autostart").as_ref())
+}
+
+// dev builds share the production app name "Meerkat", so the launch agent would
+// be registered under the same ~/Library/LaunchAgents/Meerkat.plist as the
+// installed app. running a debug build would overwrite that plist with a path
+// into target/debug, breaking the installed app's login item. skip the OS
+// registration in debug; the preference is still persisted so the toggle works.
+#[cfg(debug_assertions)]
+fn apply_autostart(_app: &AppHandle, _enabled: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    let (result, action) = if enabled {
+        (manager.enable(), "enable")
+    } else {
+        (manager.disable(), "disable")
+    };
+    result.map_err(|e| format!("Autostart {action} error: {e}"))
+}
+
+// the OS launch-agent registration and the stored preference can drift (manual
+// plist edits, a save that landed but failed to register). on startup the stored
+// value is the source of truth, so push it onto the OS state.
+pub(crate) fn sync_autostart(app: &AppHandle) {
+    let Ok(store) = app.store("settings.json") else {
+        return;
+    };
+    if let Err(e) = apply_autostart(app, read_autostart(&store)) {
+        log::warn!("{e}");
+    }
+}
 
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
@@ -33,6 +77,8 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    let autostart = read_autostart(&store);
+
     let stored_token = credentials::get_token()?;
     let has_token = stored_token.is_some();
     let connected = system::identity_connected(&url, identity.user_id, has_token)
@@ -47,6 +93,7 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
         show_drafts,
         desktop_notif,
         sound_notif,
+        autostart,
         connected,
     })
 }
@@ -70,7 +117,12 @@ pub async fn save_preferences(app: AppHandle, preferences: Preferences) -> Resul
         serde_json::json!(preferences.desktop_notif),
     );
     store.set("sound_notif", serde_json::json!(preferences.sound_notif));
+    store.set("autostart", serde_json::json!(preferences.autostart));
     store.save().map_err(|e| format!("Save error: {e}"))?;
+
+    // a failed OS registration leaves the saved preference ahead of the OS state;
+    // sync_autostart reconciles it on the next launch.
+    apply_autostart(&app, preferences.autostart)?;
 
     Ok(())
 }
@@ -169,4 +221,37 @@ pub(crate) fn is_connected(app: &AppHandle) -> bool {
     let has_token = credentials::get_token().ok().flatten().is_some();
     system::identity_connected(&identity.url, identity.user_id, has_token)
         && system::token_committed(&store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autostart_enabled_value_defaults_true_when_absent_or_non_bool() {
+        // arrange
+        let null = serde_json::Value::Null;
+        let non_bool = serde_json::json!("yes");
+        // act
+        let absent = autostart_enabled_value(None);
+        let null_value = autostart_enabled_value(Some(&null));
+        let non_bool_value = autostart_enabled_value(Some(&non_bool));
+        // assert
+        assert!(absent);
+        assert!(null_value);
+        assert!(non_bool_value);
+    }
+
+    #[test]
+    fn autostart_enabled_value_reads_explicit_bool() {
+        // arrange
+        let enabled = serde_json::json!(true);
+        let disabled = serde_json::json!(false);
+        // act
+        let enabled_value = autostart_enabled_value(Some(&enabled));
+        let disabled_value = autostart_enabled_value(Some(&disabled));
+        // assert
+        assert!(enabled_value);
+        assert!(!disabled_value);
+    }
 }

@@ -367,6 +367,20 @@ function SettingsView({ settings, onUpdate, onConnect, onDisconnect, onSavePrefe
         </div>
 
         <div className="settings-card">
+          <div className="settings-card-title">Startup</div>
+          <div className="settings-card-desc">Control how Meerkat launches</div>
+          <div className="toggle-row">
+            <div>
+              <div className="toggle-row-label">Launch at login</div>
+              <div className="toggle-row-desc">Start Meerkat automatically when you log in</div>
+            </div>
+            <button className={`toggle ${settings.autostart ? "on" : ""}`} onClick={() => toggle("autostart")}>
+              <div className="toggle-knob" />
+            </button>
+          </div>
+        </div>
+
+        <div className="settings-card">
           <div className="settings-card-title">Notifications</div>
           <div className="settings-card-desc">Control what triggers notifications</div>
           {notifPermission === false && (
