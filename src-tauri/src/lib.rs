@@ -89,7 +89,7 @@ pub fn run() {
             // avoid a flash on a login-item launch.
             if launched_by_autostart(std::env::args()) {
                 #[cfg(target_os = "macos")]
-                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             } else {
                 focus_main_window(app.handle());
             }
